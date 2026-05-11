@@ -32,6 +32,7 @@ pub fn build_pcblib_from_payload(
     let mut overlay_circles = Vec::new();
     let mut overlay_arcs = Vec::new();
     let mut overlay_regions = Vec::new();
+    let mut multilayer_fill_circles = Vec::new();
     let mut bounds = Bounds::default();
     let mut body_bounds = Bounds::default();
     let mut fallback_designator = 1usize;
@@ -177,11 +178,45 @@ pub fn build_pcblib_from_payload(
             }
             "FILL" => {
                 let layer_code = row_i32(row, 4, -1);
-                let Some(Value::Array(shapes)) = row.get(7) else {
+                let Some(shape_value) = row.get(7) else {
                     continue;
                 };
+                if layer_code == 12 {
+                    for shape in fill_shape_values(shape_value) {
+                        if let Some(circle) = try_parse_circle_shape(shape) {
+                            bounds.update_span(
+                                circle.cx - circle.radius,
+                                circle.cx + circle.radius,
+                                circle.cy - circle.radius,
+                                circle.cy + circle.radius,
+                            );
+                            multilayer_fill_circles.push(CircleRaw {
+                                layer_code,
+                                width: row_f64(row, 5, 0.0),
+                                cx: circle.cx,
+                                cy: circle.cy,
+                                radius: circle.radius,
+                            });
+                            continue;
+                        }
+                        let raw_points = parse_path_raw_points(shape);
+                        if raw_points.len() < 3 {
+                            continue;
+                        }
+                        bounds.update_from_raw_points(&raw_points);
+                        let mut points: Vec<CoordPoint> =
+                            raw_points.into_iter().map(raw_point_to_coord).collect();
+                        if points.first() != points.last() {
+                            if let Some(first) = points.first().copied() {
+                                points.push(first);
+                            }
+                        }
+                        overlay_regions.push(RegionRaw { layer_code, points });
+                    }
+                    continue;
+                }
                 if is_component_body_layer(layer_code) {
-                    for shape in shapes {
+                    for shape in fill_shape_values(shape_value) {
                         if let Some(circle) = try_parse_circle_shape(shape) {
                             body_bounds.update_span(
                                 circle.cx - circle.radius,
@@ -202,7 +237,7 @@ pub fn build_pcblib_from_payload(
                 if !is_overlay_layer(layer_code) {
                     continue;
                 }
-                for shape in shapes {
+                for shape in fill_shape_values(shape_value) {
                     if let Some(circle) = try_parse_circle_shape(shape) {
                         bounds.update_span(
                             circle.cx - circle.radius,
@@ -335,6 +370,11 @@ pub fn build_pcblib_from_payload(
         }
     }
 
+    let document_circles: Vec<CircleRaw> = overlay_circles
+        .iter()
+        .copied()
+        .filter(|circle| circle.layer_code == 13)
+        .collect();
     let component_height_mm =
         resolve_component_height_mm(payload, component_name, model_3d.as_ref());
     let mut component = PcbComponent {
@@ -381,7 +421,6 @@ pub fn build_pcblib_from_payload(
         } else {
             rotation
         };
-
         component.pads.push(PcbPad {
             designator: pad_raw.designator.clone(),
             location: coord_from_easy_units(pad_raw.x, pad_raw.y),
@@ -459,6 +498,26 @@ pub fn build_pcblib_from_payload(
                     custom_mask_expansions.push(mask_expansion);
                 }
             }
+        }
+    }
+
+    for circle in multilayer_fill_circles {
+        if has_matching_circle_marker(circle, &document_circles) {
+            push_alignment_hole(&mut component, circle);
+        } else {
+            component.regions.push(PcbRegion {
+                layer: map_graphic_layer(circle.layer_code),
+                outline: circle_region(circle.cx, circle.cy, circle.radius),
+                kind: 0,
+                net: None,
+                unique_id: None,
+                name: None,
+                is_locked: false,
+                is_tenting_top: false,
+                is_tenting_bottom: false,
+                is_keepout: false,
+                additional_params: Vec::new(),
+            });
         }
     }
 
@@ -796,7 +855,7 @@ fn choose_step_model_name(component_name: &str, title: &str) -> String {
 }
 
 fn is_overlay_layer(layer_code: i32) -> bool {
-    matches!(layer_code, 3 | 4 | 49)
+    matches!(layer_code, 3 | 4 | 12 | 13 | 49)
 }
 
 fn is_component_body_layer(layer_code: i32) -> bool {
@@ -897,6 +956,70 @@ fn normalize_angle(value: f64) -> f64 {
     angle
 }
 
+fn push_alignment_hole(component: &mut PcbComponent, circle: CircleRaw) {
+    let diameter = circle.radius * 2.0;
+    let size = coord_from_easy_units(diameter, diameter);
+    component.pads.push(PcbPad {
+        designator: String::new(),
+        location: coord_from_easy_units(circle.cx, circle.cy),
+        size_top: size,
+        size_middle: size,
+        size_bottom: size,
+        hole_size_raw: raw_from_easy_units(diameter),
+        shape_top: PAD_SHAPE_ROUND,
+        shape_middle: PAD_SHAPE_ROUND,
+        shape_bottom: PAD_SHAPE_ROUND,
+        rotation: 0.0,
+        is_plated: false,
+        layer: LAYER_MULTI,
+        is_locked: false,
+        is_tenting_top: false,
+        is_tenting_bottom: false,
+        is_keepout: false,
+        mode: 0,
+        power_plane_connect_style: 0,
+        relief_air_gap_raw: 0,
+        relief_conductor_width_raw: raw_from_mils(10.0),
+        relief_entries: 4,
+        power_plane_clearance_raw: raw_from_mils(10.0),
+        power_plane_relief_expansion_raw: raw_from_mils(20.0),
+        paste_mask_expansion_raw: 0,
+        solder_mask_expansion_raw: 0,
+        drill_type: 0,
+        jumper_id: 0,
+        hole_type: PAD_HOLE_ROUND,
+        hole_slot_length_raw: raw_from_easy_units(diameter),
+        hole_rotation: 0.0,
+        corner_radius_percentage: DEFAULT_CORNER_RADIUS_PERCENTAGE,
+    });
+
+    push_alignment_circle_tracks(component, LAYER_TOP_OVERLAY, circle);
+    push_alignment_circle_tracks(component, LAYER_MECHANICAL_1, circle);
+}
+
+fn push_alignment_circle_tracks(component: &mut PcbComponent, layer: u8, circle: CircleRaw) {
+    let points = circle_region(circle.cx, circle.cy, circle.radius);
+    if points.len() < 2 {
+        return;
+    }
+    let width_raw =
+        resolve_graphic_width_raw(circle.width).max(raw_from_mm(DEFAULT_GRAPHIC_WIDTH_MM));
+    for index in 0..points.len() {
+        component.tracks.push(PcbTrack {
+            layer,
+            start: points[index],
+            end: points[(index + 1) % points.len()],
+            width_raw,
+            is_locked: false,
+            is_tenting_top: false,
+            is_tenting_bottom: false,
+            is_keepout: false,
+            net_index: 0,
+            component_index: 0,
+        });
+    }
+}
+
 fn slot_hole_rotation(pad_rotation: f64, pad_width: f64, pad_height: f64) -> f64 {
     let long_axis_offset = if pad_height > pad_width { 90.0 } else { 0.0 };
     normalize_angle(pad_rotation + long_axis_offset)
@@ -946,6 +1069,26 @@ fn try_parse_circle_shape(shape: &Value) -> Option<CircleShape> {
         cx: value_f64(array.get(1)).unwrap_or(0.0),
         cy: value_f64(array.get(2)).unwrap_or(0.0),
         radius,
+    })
+}
+
+fn fill_shape_values(shape_value: &Value) -> Vec<&Value> {
+    let Some(array) = shape_value.as_array() else {
+        return Vec::new();
+    };
+    if array.first().and_then(Value::as_array).is_some() {
+        array.iter().collect()
+    } else {
+        vec![shape_value]
+    }
+}
+
+fn has_matching_circle_marker(circle: CircleRaw, markers: &[CircleRaw]) -> bool {
+    markers.iter().any(|marker| {
+        (marker.cx - circle.cx).abs() < 0.001
+            && (marker.cy - circle.cy).abs() < 0.001
+            && marker.radius > 0.0
+            && marker.radius <= circle.radius
     })
 }
 
@@ -1311,7 +1454,10 @@ mod tests {
         build_pcblib_from_payload, normalize_footprint_description, parse_path_raw_points,
         rectangular_pad_outline, RawPoint,
     };
-    use crate::pcblib::{LAYER_MECHANICAL_9, PAD_HOLE_SLOT, PAD_SHAPE_ROUND};
+    use crate::pcblib::{
+        LAYER_MECHANICAL_2, LAYER_MECHANICAL_9, LAYER_MULTI, LAYER_TOP_OVERLAY, PAD_HOLE_ROUND,
+        PAD_HOLE_SLOT, PAD_SHAPE_ROUND,
+    };
     use serde_json::json;
 
     #[test]
@@ -1384,6 +1530,101 @@ mod tests {
         assert_eq!(pad.hole_size_raw, 236_220);
         assert_eq!(pad.hole_slot_length_raw, 590_550);
         assert_eq!(pad.hole_rotation, 90.0);
+    }
+
+    #[test]
+    fn maps_marked_multilayer_fill_circle_to_unplated_alignment_hole() {
+        let payload = json!({"result": {"dataStr": r#"["DOCTYPE","FOOTPRINT","1.8"]
+["POLY","e2",0,"",13,9.843,["CIRCLE",-113.775,51.375,4.92],0]
+["FILL","e54",0,"",12,0.2,0,["CIRCLE",-113.775,51.375,13.78],0]"#}});
+        let library =
+            build_pcblib_from_payload(&payload, "USB-C-SMD_TYPE-C-16PIN-2MD-073", None).unwrap();
+        let component = &library.components[0];
+        let pad = &component.pads[0];
+
+        assert_eq!(component.pads.len(), 1);
+        assert_eq!(pad.layer, LAYER_MULTI);
+        assert!(!pad.is_plated);
+        assert_eq!(pad.hole_type, PAD_HOLE_ROUND);
+        assert_eq!(pad.hole_size_raw, 275_600);
+        assert_eq!(pad.size_top.x, 275_600);
+        assert_eq!(component.arcs.len(), 1);
+        assert!(
+            component
+                .tracks
+                .iter()
+                .filter(|track| track.layer == LAYER_TOP_OVERLAY)
+                .count()
+                >= 32
+        );
+    }
+
+    #[test]
+    fn maps_unmarked_nested_multilayer_fill_circle_to_multilayer_region() {
+        let payload = json!({"result": {"dataStr": r#"["DOCTYPE","FOOTPRINT","1.8"]
+["FILL","e55",0,"",12,0.2,0,[["CIRCLE",113.785,51.375,13.78]],0]"#}});
+        let library =
+            build_pcblib_from_payload(&payload, "USB-C-SMD_TYPE-C-16PIN-2MD-073", None).unwrap();
+        let component = &library.components[0];
+
+        assert_eq!(component.pads.len(), 0);
+        assert_eq!(component.regions.len(), 1);
+        assert!(component
+            .regions
+            .iter()
+            .any(|region| region.layer == LAYER_MULTI && region.outline.len() == 32));
+    }
+
+    #[test]
+    fn maps_document_circle_to_mechanical_arc() {
+        let payload = json!({"result": {"dataStr": r#"["DOCTYPE","FOOTPRINT","1.8"]
+["POLY","e2",0,"",13,9.843,["CIRCLE",-113.775,51.375,4.92],0]"#}});
+        let library =
+            build_pcblib_from_payload(&payload, "USB-C-SMD_TYPE-C-16PIN-2MD-073", None).unwrap();
+        let component = &library.components[0];
+        let arc = &component.arcs[0];
+
+        assert_eq!(component.arcs.len(), 1);
+        assert_eq!(arc.layer, LAYER_MECHANICAL_2);
+        assert_eq!(arc.radius_raw, 49_200);
+        assert_eq!(arc.width_raw, 98_430);
+    }
+
+    #[test]
+    fn c2765186_exports_two_alignment_hole_markers() {
+        let payload = json!({"result": {"dataStr": r#"["DOCTYPE","FOOTPRINT","1.8"]
+["POLY","e2",0,"",13,9.843,["CIRCLE",-113.775,51.375,4.92],0]
+["POLY","e3",0,"",13,9.843,["CIRCLE",113.785,51.375,4.92],0]
+["FILL","e54",0,"",12,0.2,0,["CIRCLE",-113.775,51.375,13.78],0]
+["FILL","e55",0,"",12,0.2,0,["CIRCLE",113.785,51.375,13.78],0]"#}});
+        let library =
+            build_pcblib_from_payload(&payload, "USB-C-SMD_TYPE-C-16PIN-2MD-073", None).unwrap();
+        let component = &library.components[0];
+        let alignment_pads: Vec<_> = component
+            .pads
+            .iter()
+            .filter(|pad| {
+                pad.layer == LAYER_MULTI && !pad.is_plated && pad.hole_size_raw == 275_600
+            })
+            .collect();
+        let alignment_arcs: Vec<_> = component
+            .tracks
+            .iter()
+            .filter(|track| {
+                track.layer == LAYER_TOP_OVERLAY
+                    && (track.start.x + 1_137_750).abs() < 140_000
+                    && (track.start.y - 513_750).abs() < 140_000
+            })
+            .collect();
+
+        assert_eq!(alignment_pads.len(), 2);
+        assert_eq!(alignment_arcs.len(), 32);
+        assert!(alignment_pads
+            .iter()
+            .any(|pad| pad.location.x == -1_137_750 && pad.location.y == 513_750));
+        assert!(alignment_pads
+            .iter()
+            .any(|pad| pad.location.x == 1_137_850 && pad.location.y == 513_750));
     }
 
     #[test]
