@@ -781,7 +781,40 @@ fn write_pad(writer: &mut BinaryWriter, pad: &PcbPad) {
         w.write_i16(0);
     });
 
-    writer.write_block_raw(0, &[]);
+    writer.write_block(0, |w| write_pad_extended_block(w, pad));
+}
+
+fn write_pad_extended_block(writer: &mut BinaryWriter, pad: &PcbPad) {
+    for _ in 0..29 {
+        writer.write_coord(pad.size_middle.x);
+    }
+    for _ in 0..29 {
+        writer.write_coord(pad.size_middle.y);
+    }
+    for _ in 0..29 {
+        writer.write_u8(pad.shape_middle);
+    }
+    writer.write_u8(0);
+    writer.write_u8(pad.hole_type);
+    writer.write_coord(pad.hole_slot_length_raw);
+    writer.write_f64(pad.hole_rotation);
+    for _ in 0..32 {
+        writer.write_coord(0);
+    }
+    for _ in 0..32 {
+        writer.write_coord(0);
+    }
+    let has_rounded_rect =
+        [pad.shape_top, pad.shape_middle, pad.shape_bottom].contains(&PAD_SHAPE_ROUNDED_RECTANGLE);
+    writer.write_bool(has_rounded_rect);
+    writer.write_u8(pad.shape_top);
+    for _ in 0..30 {
+        writer.write_u8(pad.shape_middle);
+    }
+    writer.write_u8(pad.shape_bottom);
+    for _ in 0..32 {
+        writer.write_u8(pad.corner_radius_percentage);
+    }
 }
 
 fn write_common_primitive_data(writer: &mut BinaryWriter, layer: u8, flags: u16) {
@@ -848,7 +881,11 @@ fn fnv1a64(bytes: &[u8]) -> u64 {
 }
 
 fn bool_text(value: bool) -> &'static str {
-    if value { "TRUE" } else { "FALSE" }
+    if value {
+        "TRUE"
+    } else {
+        "FALSE"
+    }
 }
 fn format_decimal(value: f64) -> String {
     format!("{value:.3}")
@@ -1115,6 +1152,97 @@ mod tests {
         assert!(compound.open_stream("/Library/Data").is_ok());
         assert!(compound.open_stream("/TEST_FOOTPRINT/Data").is_ok());
         fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn writes_full_pad_extended_slot_metadata_block() {
+        let pad = PcbPad {
+            designator: "13".to_string(),
+            location: CoordPoint::new(0, 0),
+            size_top: CoordPoint::new(433_070, 787_400),
+            size_middle: CoordPoint::new(433_070, 787_400),
+            size_bottom: CoordPoint::new(433_070, 787_400),
+            hole_size_raw: 236_220,
+            shape_top: PAD_SHAPE_ROUNDED_RECTANGLE,
+            shape_middle: PAD_SHAPE_ROUNDED_RECTANGLE,
+            shape_bottom: PAD_SHAPE_ROUNDED_RECTANGLE,
+            rotation: 90.0,
+            is_plated: true,
+            layer: LAYER_MULTI,
+            is_locked: false,
+            is_tenting_top: false,
+            is_tenting_bottom: false,
+            is_keepout: false,
+            mode: 0,
+            power_plane_connect_style: 0,
+            relief_air_gap_raw: 0,
+            relief_conductor_width_raw: 0,
+            relief_entries: 4,
+            power_plane_clearance_raw: 0,
+            power_plane_relief_expansion_raw: 0,
+            paste_mask_expansion_raw: 0,
+            solder_mask_expansion_raw: 0,
+            drill_type: 0,
+            jumper_id: 0,
+            hole_type: PAD_HOLE_SLOT,
+            hole_slot_length_raw: 590_550,
+            hole_rotation: 90.0,
+            corner_radius_percentage: 50,
+        };
+        let mut writer = BinaryWriter::default();
+        write_pad(&mut writer, &pad);
+        let bytes = writer.into_inner();
+        let extended = last_block_payload(&bytes);
+        let hole_shape_offset = (29 * 4) + (29 * 4) + 29 + 1;
+        let slot_length_offset = hole_shape_offset + 1;
+        let hole_rotation_offset = slot_length_offset + 4;
+        let has_rounded_offset = hole_rotation_offset + 8 + (32 * 4) + (32 * 4);
+        let rounded_shapes_offset = has_rounded_offset + 1;
+        let corner_radius_offset = rounded_shapes_offset + 32;
+
+        assert_eq!(extended.len(), 596);
+        assert_eq!(extended[hole_shape_offset], PAD_HOLE_SLOT);
+        assert_eq!(
+            i32::from_le_bytes(
+                extended[slot_length_offset..slot_length_offset + 4]
+                    .try_into()
+                    .unwrap()
+            ),
+            590_550
+        );
+        assert_eq!(
+            f64::from_le_bytes(
+                extended[hole_rotation_offset..hole_rotation_offset + 8]
+                    .try_into()
+                    .unwrap()
+            ),
+            90.0
+        );
+        assert_eq!(extended[has_rounded_offset], 1);
+        assert_eq!(extended[rounded_shapes_offset], PAD_SHAPE_ROUNDED_RECTANGLE);
+        assert_eq!(
+            extended[rounded_shapes_offset + 31],
+            PAD_SHAPE_ROUNDED_RECTANGLE
+        );
+        assert!(extended[corner_radius_offset..]
+            .iter()
+            .all(|value| *value == 50));
+    }
+
+    fn last_block_payload(bytes: &[u8]) -> &[u8] {
+        let mut offset = 0usize;
+        let mut last_payload = &[][..];
+        while offset + 4 <= bytes.len() {
+            let header = u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap());
+            let length = (header & 0x00FF_FFFF) as usize;
+            let start = offset + 4;
+            let end = start + length;
+            assert!(end <= bytes.len());
+            last_payload = &bytes[start..end];
+            offset = end;
+        }
+        assert_eq!(offset, bytes.len());
+        last_payload
     }
 
     #[test]

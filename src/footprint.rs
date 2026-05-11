@@ -2,12 +2,12 @@ use serde_json::Value;
 
 use crate::error::{AppError, Result};
 use crate::pcblib::{
-    CoordPoint, LAYER_BOTTOM, LAYER_BOTTOM_OVERLAY, LAYER_MECHANICAL_1, LAYER_MECHANICAL_2,
-    LAYER_MECHANICAL_5, LAYER_MECHANICAL_6, LAYER_MECHANICAL_9, LAYER_MULTI, LAYER_TOP,
-    LAYER_TOP_OVERLAY, PAD_HOLE_ROUND, PAD_HOLE_SLOT, PAD_HOLE_SQUARE, PAD_SHAPE_OCTAGONAL,
-    PAD_SHAPE_RECTANGULAR, PAD_SHAPE_ROUND, PAD_SHAPE_ROUNDED_RECTANGLE, PcbArc, PcbComponent,
-    PcbComponentBody, PcbExtendedPrimitiveInfo, PcbLibrary, PcbModel, PcbPad, PcbRegion, PcbTrack,
-    stable_guid,
+    stable_guid, CoordPoint, PcbArc, PcbComponent, PcbComponentBody, PcbExtendedPrimitiveInfo,
+    PcbLibrary, PcbModel, PcbPad, PcbRegion, PcbTrack, LAYER_BOTTOM, LAYER_BOTTOM_OVERLAY,
+    LAYER_MECHANICAL_1, LAYER_MECHANICAL_2, LAYER_MECHANICAL_5, LAYER_MECHANICAL_6,
+    LAYER_MECHANICAL_9, LAYER_MULTI, LAYER_TOP, LAYER_TOP_OVERLAY, PAD_HOLE_ROUND, PAD_HOLE_SLOT,
+    PAD_HOLE_SQUARE, PAD_SHAPE_OCTAGONAL, PAD_SHAPE_RECTANGULAR, PAD_SHAPE_ROUND,
+    PAD_SHAPE_ROUNDED_RECTANGLE,
 };
 use crate::util::{nested_string, sanitize_filename};
 
@@ -60,8 +60,15 @@ pub fn build_pcblib_from_payload(
                 if let Some(Value::Array(hole_array)) = row.get(9) {
                     hole_shape =
                         value_string(hole_array.first()).unwrap_or_else(|| "ROUND".to_string());
-                    hole = value_f64(hole_array.get(1)).unwrap_or(0.0);
-                    hole_slot = value_f64(hole_array.get(2)).unwrap_or(hole);
+                    let first_dimension = value_f64(hole_array.get(1)).unwrap_or(0.0);
+                    let second_dimension = value_f64(hole_array.get(2)).unwrap_or(first_dimension);
+                    if hole_shape.trim().eq_ignore_ascii_case("SLOT") {
+                        hole = first_dimension.min(second_dimension);
+                        hole_slot = first_dimension.max(second_dimension);
+                    } else {
+                        hole = first_dimension;
+                        hole_slot = second_dimension;
+                    }
                 }
                 let mut width: f64 = 10.0;
                 let mut height: f64 = 10.0;
@@ -369,6 +376,12 @@ pub fn build_pcblib_from_payload(
                 normalize_angle(pad_raw.rotation),
             )
         };
+        let hole_rotation = if hole_type == PAD_HOLE_SLOT {
+            slot_hole_rotation(rotation, width, height)
+        } else {
+            rotation
+        };
+
         component.pads.push(PcbPad {
             designator: pad_raw.designator.clone(),
             location: coord_from_easy_units(pad_raw.x, pad_raw.y),
@@ -403,7 +416,7 @@ pub fn build_pcblib_from_payload(
             jumper_id: 0,
             hole_type,
             hole_slot_length_raw,
-            hole_rotation: 0.0,
+            hole_rotation,
             corner_radius_percentage: DEFAULT_CORNER_RADIUS_PERCENTAGE,
         });
 
@@ -511,9 +524,11 @@ pub fn build_pcblib_from_payload(
             });
         }
     }
-    let mask_region_start =
-        component.pads.len() + component.tracks.len() + component.arcs.len() + component.regions.len()
-            + pad_shape_regions.len();
+    let mask_region_start = component.pads.len()
+        + component.tracks.len()
+        + component.arcs.len()
+        + component.regions.len()
+        + pad_shape_regions.len();
     component.regions.extend(pad_shape_regions);
     component.regions.extend(custom_mask_regions);
     for (offset, expansion_units) in custom_mask_expansions.into_iter().enumerate() {
@@ -524,18 +539,12 @@ pub fn build_pcblib_from_payload(
                 object_name: "Region".to_string(),
                 params: vec![
                     ("TYPE".to_string(), "Mask".to_string()),
-                    (
-                        "SOLDERMASKEXPANSIONMODE".to_string(),
-                        "Manual".to_string(),
-                    ),
+                    ("SOLDERMASKEXPANSIONMODE".to_string(), "Manual".to_string()),
                     (
                         "SOLDERMASKEXPANSION_MANUAL".to_string(),
                         format!("{expansion_units:.3}mil"),
                     ),
-                    (
-                        "PASTEMASKEXPANSIONMODE".to_string(),
-                        "None".to_string(),
-                    ),
+                    ("PASTEMASKEXPANSIONMODE".to_string(), "None".to_string()),
                 ],
             });
     }
@@ -888,6 +897,11 @@ fn normalize_angle(value: f64) -> f64 {
     angle
 }
 
+fn slot_hole_rotation(pad_rotation: f64, pad_width: f64, pad_height: f64) -> f64 {
+    let long_axis_offset = if pad_height > pad_width { 90.0 } else { 0.0 };
+    normalize_angle(pad_rotation + long_axis_offset)
+}
+
 fn row_f64(row: &[Value], index: usize, default: f64) -> f64 {
     value_f64(row.get(index)).unwrap_or(default)
 }
@@ -958,7 +972,10 @@ fn add_axis_aligned_rect_points(
     let right = x.max(x2);
     let top = y.max(y2);
     let bottom = y.min(y2);
-    let radius = radius.abs().min((right - left).abs() / 2.0).min((top - bottom).abs() / 2.0);
+    let radius = radius
+        .abs()
+        .min((right - left).abs() / 2.0)
+        .min((top - bottom).abs() / 2.0);
 
     if radius <= 1e-9 {
         add_raw_point(points, left, top);
@@ -1291,10 +1308,10 @@ fn mask_region_layers(layer_code: i32, hole_mm: f64) -> Vec<(u8, &'static str)> 
 #[cfg(test)]
 mod tests {
     use super::{
-        RawPoint, build_pcblib_from_payload, normalize_footprint_description, parse_path_raw_points,
-        rectangular_pad_outline,
+        build_pcblib_from_payload, normalize_footprint_description, parse_path_raw_points,
+        rectangular_pad_outline, RawPoint,
     };
-    use crate::pcblib::{LAYER_MECHANICAL_9, PAD_SHAPE_ROUND};
+    use crate::pcblib::{LAYER_MECHANICAL_9, PAD_HOLE_SLOT, PAD_SHAPE_ROUND};
     use serde_json::json;
 
     #[test]
@@ -1353,6 +1370,20 @@ mod tests {
             .iter()
             .any(|region| region.layer == LAYER_MECHANICAL_9 && region.outline.len() == 6));
         assert_eq!(component.extended_primitive_information.len(), 1);
+    }
+
+    #[test]
+    fn maps_easyeda_slot_pad_to_altium_slot_drill() {
+        let payload = json!({"result": {"dataStr": r#"["DOCTYPE","FOOTPRINT","1.8"]
+["PAD","e56",0,"",12,"13",-170.275,71.855,0,["SLOT",59.055,23.622],["OVAL",43.307,78.74],[],0.002,-0.003,90,1,0,1.9689999999999999,1.9689999999999999,0,0,0]"#}});
+        let library =
+            build_pcblib_from_payload(&payload, "USB-C-SMD_TYPE-C-16PIN-2MD-073", None).unwrap();
+        let pad = &library.components[0].pads[0];
+
+        assert_eq!(pad.hole_type, PAD_HOLE_SLOT);
+        assert_eq!(pad.hole_size_raw, 236_220);
+        assert_eq!(pad.hole_slot_length_raw, 590_550);
+        assert_eq!(pad.hole_rotation, 90.0);
     }
 
     #[test]
