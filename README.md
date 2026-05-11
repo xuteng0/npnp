@@ -126,3 +126,5 @@ Append new parts into an existing merged library
 ```
 
 Another easy way is to use `GUI TOOL` <###> [`SeEx`](https://github.com/linkyourbin/seex). And it is STRONGLY recommended. ENJOY, 😊.
+
+You are welcome to issue.
