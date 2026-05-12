@@ -379,13 +379,22 @@ fn unique_section_key(name: &str, used: &mut HashSet<String>) -> String {
 }
 
 pub fn section_key_from_name(name: &str) -> String {
-    if name.is_empty() {
-        return "_".to_string();
+    let mut key = String::new();
+    for character in name.trim().chars() {
+        if key.len() >= 31 {
+            break;
+        }
+        if character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.') {
+            key.push(character);
+        } else {
+            key.push('_');
+        }
     }
-    name.chars()
-        .take(31)
-        .map(|character| if character == '/' { '_' } else { character })
-        .collect()
+    if key.is_empty() {
+        "_".to_string()
+    } else {
+        key
+    }
 }
 
 fn file_header_bytes(_library: &PcbLibrary) -> Vec<u8> {

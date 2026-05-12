@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -8,8 +8,8 @@ use cfb::CompoundFile;
 use encoding_rs::GBK;
 
 use crate::error::{AppError, Result};
-use crate::pcblib::{PcbLibrary, write_pcblib};
-use crate::schlib::{Component, write_schlib_library};
+use crate::pcblib::{write_pcblib, PcbLibrary};
+use crate::schlib::{write_schlib_library, Component};
 
 const PCBLIB_LIBRARY_DATA_TEMPLATE: &str = include_str!("pcblib_library_data_template.txt");
 
@@ -72,16 +72,23 @@ pub(crate) fn read_schlib_records(path: &Path) -> Result<Vec<SchlibRecord>> {
     let file = File::open(path)?;
     let mut compound = CompoundFile::open(file)?;
     let header = read_stream_bytes(&mut compound, "/FileHeader")?;
-    let header_pairs = first_param_block_pairs(&header, "SchLib file header")?;
+    let header_pairs = first_schlib_param_block_pairs(&header, "SchLib file header")?;
     let count = parse_usize_param(&header_pairs, "COMPCOUNT").unwrap_or(0);
     let names: Vec<String> = (0..count)
         .filter_map(|index| param_value(&header_pairs, &format!("LIBREF{index}")))
         .map(ToOwned::to_owned)
         .collect();
 
-    let sections = collect_sections(names.iter().map(String::as_str));
+    let derived_sections = collect_sections(names.iter().map(String::as_str));
+    let explicit_sections = read_schlib_section_keys(&mut compound).unwrap_or_default();
     let mut records = Vec::with_capacity(names.len());
-    for (name, section_key) in names.into_iter().zip(sections.into_iter()) {
+    for (index, name) in names.into_iter().enumerate() {
+        let section_key = explicit_sections
+            .get(&name)
+            .map(String::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| derived_sections[index].clone());
         let data = read_stream_bytes(&mut compound, &format!("/{section_key}/Data"))?;
         records.push(parse_schlib_record(name, data)?);
     }
@@ -126,10 +133,17 @@ pub(crate) fn read_pcblib_records(path: &Path) -> Result<PcblibRecordLibrary> {
     let file = File::open(path)?;
     let mut compound = CompoundFile::open(file)?;
     let names = read_pcblib_component_names(&mut compound)?;
-    let sections = collect_sections(names.iter().map(String::as_str));
+    let derived_sections = collect_sections(names.iter().map(String::as_str));
+    let explicit_sections = read_pcblib_section_keys(&mut compound).unwrap_or_default();
 
     let mut components = Vec::with_capacity(names.len());
-    for (name, section_key) in names.into_iter().zip(sections.into_iter()) {
+    for (index, name) in names.into_iter().enumerate() {
+        let section_key = explicit_sections
+            .get(&name)
+            .map(String::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| derived_sections[index].clone());
         let primitive_count = read_storage_header(
             &mut compound,
             &format!("/{section_key}/Header"),
@@ -294,7 +308,7 @@ fn parse_schlib_record(name: String, data: Vec<u8>) -> Result<SchlibRecord> {
         if block.flags != 0 {
             continue;
         }
-        let pairs = parse_param_pairs(&cstring_text(block.payload));
+        let pairs = parse_param_pairs(&schlib_cstring_text(block.payload));
         if param_value(&pairs, "RECORD").is_some_and(|value| value == "1") {
             if let Some(value) = param_value(&pairs, "COMPONENTDESCRIPTION") {
                 description = value.to_string();
@@ -318,6 +332,28 @@ fn parse_schlib_record(name: String, data: Vec<u8>) -> Result<SchlibRecord> {
         identity,
         data,
     })
+}
+
+fn read_schlib_section_keys(compound: &mut CompoundFile<File>) -> Result<HashMap<String, String>> {
+    let data = match read_stream_bytes(compound, "/SectionKeys") {
+        Ok(data) => data,
+        Err(_) => return Ok(HashMap::new()),
+    };
+    let pairs = first_schlib_param_block_pairs(&data, "SchLib section keys")?;
+    let count = parse_usize_param(&pairs, "KeyCount").unwrap_or(0);
+    let mut sections = HashMap::with_capacity(count);
+    for index in 0..count {
+        let Some(name) = param_value(&pairs, &format!("LibRef{index}")) else {
+            continue;
+        };
+        let Some(section_key) = param_value(&pairs, &format!("SectionKey{index}")) else {
+            continue;
+        };
+        if !name.trim().is_empty() && !section_key.trim().is_empty() {
+            sections.insert(name.to_string(), section_key.to_string());
+        }
+    }
+    Ok(sections)
 }
 
 fn extract_schlib_identity(pairs: &[(String, String)]) -> Option<String> {
@@ -353,6 +389,32 @@ fn read_pcblib_component_names(compound: &mut CompoundFile<File>) -> Result<Vec<
         names.push(parse_pascal_short_string(block.payload));
     }
     Ok(names)
+}
+
+fn read_pcblib_section_keys(compound: &mut CompoundFile<File>) -> Result<HashMap<String, String>> {
+    let data = match read_stream_bytes(compound, "/SectionKeys") {
+        Ok(data) => data,
+        Err(_) => return Ok(HashMap::new()),
+    };
+    let mut offset = 0usize;
+    if offset + 4 > data.len() {
+        return Err(AppError::InvalidResponse(
+            "invalid PcbLib section keys stream".to_string(),
+        ));
+    }
+    let count = i32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()).max(0) as usize;
+    offset += 4;
+    let mut sections = HashMap::with_capacity(count);
+    for _ in 0..count {
+        let name_block = read_block(&data, &mut offset, "PcbLib section key name")?;
+        let key_block = read_block(&data, &mut offset, "PcbLib section key value")?;
+        let name = parse_pascal_short_string(name_block.payload);
+        let section_key = parse_pascal_short_string(key_block.payload);
+        if !name.trim().is_empty() && !section_key.trim().is_empty() {
+            sections.insert(name, section_key);
+        }
+    }
+    Ok(sections)
 }
 
 fn read_pcblib_model_entries(
@@ -416,6 +478,17 @@ fn first_param_block_pairs(data: &[u8], label: &str) -> Result<Vec<(String, Stri
     Ok(parse_param_pairs(&cstring_text(block.payload)))
 }
 
+fn first_schlib_param_block_pairs(data: &[u8], label: &str) -> Result<Vec<(String, String)>> {
+    let mut offset = 0usize;
+    let block = read_block(data, &mut offset, label)?;
+    if block.flags != 0 {
+        return Err(AppError::InvalidResponse(format!(
+            "missing text block in {label}"
+        )));
+    }
+    Ok(parse_param_pairs(&schlib_cstring_text(block.payload)))
+}
+
 fn parse_usize_param(pairs: &[(String, String)], key: &str) -> Option<usize> {
     param_value(pairs, key)?.trim().parse().ok()
 }
@@ -442,6 +515,15 @@ fn cstring_text(data: &[u8]) -> String {
         .position(|byte| *byte == 0)
         .unwrap_or(data.len());
     String::from_utf8_lossy(&data[..len]).into_owned()
+}
+
+fn schlib_cstring_text(data: &[u8]) -> String {
+    let len = data
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(data.len());
+    let (text, _, _) = GBK.decode(&data[..len]);
+    text.into_owned()
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -539,13 +621,22 @@ fn unique_section_key(name: &str, used: &mut HashSet<String>) -> String {
 }
 
 fn section_key_from_name(name: &str) -> String {
-    if name.is_empty() {
-        return "_".to_string();
+    let mut key = String::new();
+    for character in name.trim().chars() {
+        if key.len() >= 31 {
+            break;
+        }
+        if character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.') {
+            key.push(character);
+        } else {
+            key.push('_');
+        }
     }
-    name.chars()
-        .take(31)
-        .map(|character| if character == '/' { '_' } else { character })
-        .collect()
+    if key.is_empty() {
+        "_".to_string()
+    } else {
+        key
+    }
 }
 
 fn write_stream(compound: &mut CompoundFile<File>, path: &str, data: &[u8]) -> std::io::Result<()> {
@@ -882,7 +973,7 @@ mod tests {
     };
     use crate::footprint::build_pcblib_from_payload;
     use crate::schlib::{
-        SchlibMetadata, SchlibParameter, build_component_from_payload_with_metadata,
+        build_component_from_payload_with_metadata, SchlibMetadata, SchlibParameter,
     };
     use serde_json::Value;
     use std::fs;
@@ -932,6 +1023,58 @@ mod tests {
         assert_eq!(records[0].identity.as_deref(), Some("C2040"));
         assert_eq!(records[1].name, "COMP_B");
         assert_eq!(records[1].identity.as_deref(), Some("C42"));
+        fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn schlib_records_round_trip_non_ascii_component_name() {
+        let payload: Value =
+            serde_json::from_str(include_str!("../tests/fixtures/easyeda_symbol.json"))
+                .expect("symbol fixture");
+        let non_ascii_name = "SMD7525-32\u{03A9}";
+        let metadata = SchlibMetadata {
+            description: Some("Non ASCII component".to_string()),
+            designator: Some("BUZZER?".to_string()),
+            comment: Some(non_ascii_name.to_string()),
+            parameters: vec![SchlibParameter {
+                name: "NPNP_COMPONENT_ID".to_string(),
+                value: "C50387083".to_string(),
+            }],
+            footprint_model_name: None,
+            footprint_library_file: None,
+        };
+        let ascii_metadata = SchlibMetadata {
+            description: Some("ASCII component".to_string()),
+            designator: Some("U?".to_string()),
+            comment: Some("COMP_A".to_string()),
+            parameters: vec![SchlibParameter {
+                name: "NPNP_COMPONENT_ID".to_string(),
+                value: "C2040".to_string(),
+            }],
+            footprint_model_name: None,
+            footprint_library_file: None,
+        };
+        let ascii_component =
+            build_component_from_payload_with_metadata(&payload, "COMP_A", &ascii_metadata)
+                .expect("build ASCII component");
+        let component =
+            build_component_from_payload_with_metadata(&payload, non_ascii_name, &metadata)
+                .expect("build component");
+
+        let record = schlib_record_from_component(&component).expect("capture SchLib record");
+        assert_eq!(record.name, non_ascii_name);
+        assert_eq!(record.identity.as_deref(), Some("C50387083"));
+        let ascii_record =
+            schlib_record_from_component(&ascii_component).expect("capture ASCII SchLib record");
+
+        let path = temp_path("npnp_merge_schlib_non_ascii", "SchLib");
+        write_schlib_records(&[ascii_record, record], &path).expect("write merged SchLib");
+        let records = read_schlib_records(&path).expect("read merged SchLib");
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].name, "COMP_A");
+        assert_eq!(records[0].identity.as_deref(), Some("C2040"));
+        assert_eq!(records[1].name, non_ascii_name);
+        assert_eq!(records[1].identity.as_deref(), Some("C50387083"));
         fs::remove_file(path).ok();
     }
 

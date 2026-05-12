@@ -712,13 +712,7 @@ pub(super) fn normalize_component_name(component_name: &str) -> String {
 }
 
 pub(super) fn section_key_from_name(name: &str) -> String {
-    if name.is_empty() {
-        return "_".to_string();
-    }
-    name.chars()
-        .take(31)
-        .map(|character| if character == '/' { '_' } else { character })
-        .collect()
+    ascii_section_key_from_name(name)
 }
 
 pub(super) fn stable_unique_id(name: &str, salt: &str) -> String {
@@ -753,6 +747,25 @@ fn encode_ansi_lossy(text: &str) -> Vec<u8> {
     let sanitized = text.replace(' ', "?");
     let (bytes, _, _) = GBK.encode(&sanitized);
     bytes.into_owned()
+}
+
+fn ascii_section_key_from_name(name: &str) -> String {
+    let mut key = String::new();
+    for character in name.trim().chars() {
+        if key.len() >= 31 {
+            break;
+        }
+        if character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.') {
+            key.push(character);
+        } else {
+            key.push('_');
+        }
+    }
+    if key.is_empty() {
+        "_".to_string()
+    } else {
+        key
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -984,7 +997,7 @@ impl BinaryWriter {
 
 #[cfg(test)]
 mod tests {
-    use super::{FILL_BGR, build_component, write_schlib_from_payload};
+    use super::{build_component, write_schlib_from_payload, FILL_BGR};
     use serde_json::json;
     use std::fs::{self, File};
     use std::time::{SystemTime, UNIX_EPOCH};
