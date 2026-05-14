@@ -58,16 +58,11 @@ PCB library screenshots:
 
 Install Rust from <https://rustup.rs/> if you do not already have it.
 
+## Note
 
-## License
-
-`npnp` now uses the closest standard license to the current project intent: `PolyForm-Noncommercial-1.0.0` in `LICENSE.md`.
-
-- Non-commercial use, research, evaluation, and personal experimentation are allowed.
-- Commercial use, paid redistribution, paid service use, or use inside a commercial workflow requires separate permission from the author.
-- If you redistribute the project, keep the license text and required notices.
-- The PolyForm license does not legally require pull requests. This project still asks anyone publishing modified versions to mention the original `npnp` project and, when possible, send changes back as a pull request.
-- This is source-available and non-commercial, not an OSI open-source license.
+- You need do the check all the `sch/symbol` and `pcb/footprint` before you export the fabrication files.
+- No promise made for all components meet all your request.
+- Components' ID and the sreenshot must be provided when you hit a bug.
 
 ## How to use
 
