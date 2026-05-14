@@ -60,9 +60,8 @@ Install Rust from <https://rustup.rs/> if you do not already have it.
 
 ## Note
 
-- You need do the check all the `sch/symbol` and `pcb/footprint` before you export the fabrication files.
-- No promise made for all components meet all your request.
-- Components' ID and the sreenshot must be provided when you hit a bug.
+- Make sure that you check all the `sch/symbol` and `pcb/footprint` before fabrication files exported.
+- No promise made when you use the tool.
 
 ## How to use
 
