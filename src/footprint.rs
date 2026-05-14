@@ -2,12 +2,12 @@ use serde_json::Value;
 
 use crate::error::{AppError, Result};
 use crate::pcblib::{
-    stable_guid, CoordPoint, PcbArc, PcbComponent, PcbComponentBody, PcbExtendedPrimitiveInfo,
-    PcbLibrary, PcbModel, PcbPad, PcbRegion, PcbTrack, LAYER_BOTTOM, LAYER_BOTTOM_OVERLAY,
-    LAYER_MECHANICAL_1, LAYER_MECHANICAL_2, LAYER_MECHANICAL_5, LAYER_MECHANICAL_6,
-    LAYER_MECHANICAL_9, LAYER_MULTI, LAYER_TOP, LAYER_TOP_OVERLAY, PAD_HOLE_ROUND, PAD_HOLE_SLOT,
-    PAD_HOLE_SQUARE, PAD_SHAPE_OCTAGONAL, PAD_SHAPE_RECTANGULAR, PAD_SHAPE_ROUND,
-    PAD_SHAPE_ROUNDED_RECTANGLE,
+    CoordPoint, LAYER_BOTTOM, LAYER_BOTTOM_OVERLAY, LAYER_MECHANICAL_1, LAYER_MECHANICAL_2,
+    LAYER_MECHANICAL_5, LAYER_MECHANICAL_6, LAYER_MECHANICAL_9, LAYER_MULTI, LAYER_TOP,
+    LAYER_TOP_OVERLAY, PAD_HOLE_ROUND, PAD_HOLE_SLOT, PAD_HOLE_SQUARE, PAD_SHAPE_OCTAGONAL,
+    PAD_SHAPE_RECTANGULAR, PAD_SHAPE_ROUND, PAD_SHAPE_ROUNDED_RECTANGLE, PcbArc, PcbComponent,
+    PcbComponentBody, PcbExtendedPrimitiveInfo, PcbLibrary, PcbModel, PcbPad, PcbRegion, PcbTrack,
+    stable_guid,
 };
 use crate::util::{nested_string, sanitize_filename};
 
@@ -19,7 +19,6 @@ const DEFAULT_CORNER_RADIUS_PERCENTAGE: u8 = 50;
 const MIN_COMPONENT_BODY_HEIGHT_MM: f64 = 0.2;
 const CUSTOM_PAD_HOTSPOT_UNITS: f64 = 2.3792;
 const DEFAULT_PAD_SOLDER_MASK_EXPANSION_MIL: f64 = 1.969;
-
 pub fn build_pcblib_from_payload(
     payload: &Value,
     component_name: &str,
@@ -49,8 +48,8 @@ pub fn build_pcblib_from_payload(
                     designator = fallback_designator.to_string();
                     fallback_designator += 1;
                 }
-                let x = row_f64(row, 6, 0.0);
-                let y = row_f64(row, 7, 0.0);
+                let mut x = row_f64(row, 6, 0.0);
+                let mut y = row_f64(row, 7, 0.0);
                 let mut rotation = row_f64(row, 8, f64::NAN);
                 if rotation.is_nan() {
                     rotation = row_f64(row, 14, 0.0);
@@ -84,7 +83,14 @@ pub fn build_pcblib_from_payload(
                             if let Some(poly_bounds) = Bounds::from_raw_points(&poly_raw_points) {
                                 width = width.max(poly_bounds.max_x - poly_bounds.min_x);
                                 height = height.max(poly_bounds.max_y - poly_bounds.min_y);
-                                if poly_raw_points.len() >= 3 {
+                                if let Some(rect) = axis_aligned_rect_from_points(&poly_raw_points)
+                                {
+                                    shape = "RECT".to_string();
+                                    x = rect.center_x;
+                                    y = rect.center_y;
+                                    width = rect.width;
+                                    height = rect.height;
+                                } else if poly_raw_points.len() >= 3 {
                                     polygon_points = Some(poly_raw_points);
                                 }
                             }
@@ -395,9 +401,6 @@ pub fn build_pcblib_from_payload(
 
     for pad_raw in pads {
         let hole_mm = easy_units_to_mm(pad_raw.hole);
-        let layer = map_pad_layer(pad_raw.layer_code, hole_mm);
-        let hole_type = map_pad_hole_type(&pad_raw.hole_shape);
-        let hole_slot_length_raw = raw_from_mm(easy_units_to_mm(pad_raw.hole_slot));
         let is_custom_poly = hole_mm <= 0.000_001
             && pad_raw.shape.eq_ignore_ascii_case("POLY")
             && pad_raw.polygon_points.is_some();
@@ -416,48 +419,21 @@ pub fn build_pcblib_from_payload(
                 normalize_angle(pad_raw.rotation),
             )
         };
-        let hole_rotation = if hole_type == PAD_HOLE_SLOT {
-            slot_hole_rotation(rotation, width, height)
-        } else {
-            rotation
-        };
-        component.pads.push(PcbPad {
-            designator: pad_raw.designator.clone(),
-            location: coord_from_easy_units(pad_raw.x, pad_raw.y),
-            size_top: coord_from_easy_units(width, height),
-            size_middle: coord_from_easy_units(width, height),
-            size_bottom: coord_from_easy_units(width, height),
-            hole_size_raw: raw_from_mm(hole_mm),
-            shape_top: shape,
-            shape_middle: shape,
-            shape_bottom: shape,
+        push_pad(
+            &mut component,
+            &pad_raw,
+            pad_raw.x,
+            pad_raw.y,
+            width,
+            height,
             rotation,
-            is_plated: true,
-            layer,
-            is_locked: false,
-            is_tenting_top: false,
-            is_tenting_bottom: false,
-            is_keepout: false,
-            mode: 0,
-            power_plane_connect_style: 0,
-            relief_air_gap_raw: 0,
-            relief_conductor_width_raw: raw_from_mils(10.0),
-            relief_entries: 4,
-            power_plane_clearance_raw: raw_from_mils(10.0),
-            power_plane_relief_expansion_raw: raw_from_mils(20.0),
-            paste_mask_expansion_raw: 0,
-            solder_mask_expansion_raw: if is_custom_poly {
+            shape,
+            if is_custom_poly {
                 0
             } else {
                 raw_from_mils(DEFAULT_PAD_SOLDER_MASK_EXPANSION_MIL)
             },
-            drill_type: 0,
-            jumper_id: 0,
-            hole_type,
-            hole_slot_length_raw,
-            hole_rotation,
-            corner_radius_percentage: DEFAULT_CORNER_RADIUS_PERCENTAGE,
-        });
+        );
 
         if let Some(region_outline) = pad_outline_region(&pad_raw) {
             pad_shape_regions.push(PcbRegion {
@@ -664,6 +640,61 @@ pub fn build_pcblib_from_payload(
     }
     library.components.push(component);
     Ok(library)
+}
+
+fn push_pad(
+    component: &mut PcbComponent,
+    pad_raw: &PadRaw,
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+    rotation: f64,
+    shape: u8,
+    solder_mask_expansion_raw: i32,
+) {
+    let hole_mm = easy_units_to_mm(pad_raw.hole);
+    let layer = map_pad_layer(pad_raw.layer_code, hole_mm);
+    let hole_type = map_pad_hole_type(&pad_raw.hole_shape);
+    let hole_slot_length_raw = raw_from_mm(easy_units_to_mm(pad_raw.hole_slot));
+    let hole_rotation = if hole_type == PAD_HOLE_SLOT {
+        slot_hole_rotation(rotation, width, height)
+    } else {
+        rotation
+    };
+    component.pads.push(PcbPad {
+        designator: pad_raw.designator.clone(),
+        location: coord_from_easy_units(x, y),
+        size_top: coord_from_easy_units(width, height),
+        size_middle: coord_from_easy_units(width, height),
+        size_bottom: coord_from_easy_units(width, height),
+        hole_size_raw: raw_from_mm(hole_mm),
+        shape_top: shape,
+        shape_middle: shape,
+        shape_bottom: shape,
+        rotation,
+        is_plated: true,
+        layer,
+        is_locked: false,
+        is_tenting_top: false,
+        is_tenting_bottom: false,
+        is_keepout: false,
+        mode: 0,
+        power_plane_connect_style: 0,
+        relief_air_gap_raw: 0,
+        relief_conductor_width_raw: raw_from_mils(10.0),
+        relief_entries: 4,
+        power_plane_clearance_raw: raw_from_mils(10.0),
+        power_plane_relief_expansion_raw: raw_from_mils(20.0),
+        paste_mask_expansion_raw: 0,
+        solder_mask_expansion_raw,
+        drill_type: 0,
+        jumper_id: 0,
+        hole_type,
+        hole_slot_length_raw,
+        hole_rotation,
+        corner_radius_percentage: DEFAULT_CORNER_RADIUS_PERCENTAGE,
+    });
 }
 
 fn parse_easyeda_rows(payload: &Value) -> Result<Vec<Vec<Value>>> {
@@ -1326,6 +1357,13 @@ struct CircleShape {
     cy: f64,
     radius: f64,
 }
+#[derive(Debug, Clone, Copy)]
+struct AxisAlignedRect {
+    center_x: f64,
+    center_y: f64,
+    width: f64,
+    height: f64,
+}
 #[derive(Debug, Clone)]
 struct Model3dRaw {
     title: String,
@@ -1396,6 +1434,69 @@ fn pad_outline_region(pad: &PadRaw) -> Option<Vec<CoordPoint>> {
     rectangular_pad_outline(pad.x, pad.y, pad.width, pad.height, pad.rotation)
 }
 
+fn axis_aligned_rect_from_points(points: &[RawPoint]) -> Option<AxisAlignedRect> {
+    let mut unique = Vec::new();
+    for point in points {
+        if unique
+            .iter()
+            .any(|existing| same_raw_point(*existing, *point))
+        {
+            continue;
+        }
+        unique.push(*point);
+    }
+    if unique.len() != 4 {
+        return None;
+    }
+
+    let mut xs = Vec::new();
+    let mut ys = Vec::new();
+    for point in &unique {
+        push_unique_f64(&mut xs, point.x);
+        push_unique_f64(&mut ys, point.y);
+    }
+    if xs.len() != 2 || ys.len() != 2 {
+        return None;
+    }
+    xs.sort_by(|left, right| left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal));
+    ys.sort_by(|left, right| left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal));
+
+    for x in &xs {
+        for y in &ys {
+            if !unique
+                .iter()
+                .any(|point| same_f64(point.x, *x) && same_f64(point.y, *y))
+            {
+                return None;
+            }
+        }
+    }
+
+    let width = xs[1] - xs[0];
+    let height = ys[1] - ys[0];
+    (width > 0.000_001 && height > 0.000_001).then_some(AxisAlignedRect {
+        center_x: (xs[0] + xs[1]) / 2.0,
+        center_y: (ys[0] + ys[1]) / 2.0,
+        width,
+        height,
+    })
+}
+
+fn push_unique_f64(values: &mut Vec<f64>, value: f64) {
+    if values.iter().any(|existing| same_f64(*existing, value)) {
+        return;
+    }
+    values.push(value);
+}
+
+fn same_raw_point(left: RawPoint, right: RawPoint) -> bool {
+    same_f64(left.x, right.x) && same_f64(left.y, right.y)
+}
+
+fn same_f64(left: f64, right: f64) -> bool {
+    (left - right).abs() < 1e-6
+}
+
 fn rectangular_pad_outline(
     center_x: f64,
     center_y: f64,
@@ -1451,8 +1552,8 @@ fn mask_region_layers(layer_code: i32, hole_mm: f64) -> Vec<(u8, &'static str)> 
 #[cfg(test)]
 mod tests {
     use super::{
-        build_pcblib_from_payload, normalize_footprint_description, parse_path_raw_points,
-        rectangular_pad_outline, RawPoint,
+        RawPoint, build_pcblib_from_payload, normalize_footprint_description,
+        parse_path_raw_points, rectangular_pad_outline,
     };
     use crate::pcblib::{
         LAYER_MECHANICAL_2, LAYER_MECHANICAL_9, LAYER_MULTI, LAYER_TOP_OVERLAY, PAD_HOLE_ROUND,
@@ -1475,10 +1576,12 @@ mod tests {
         assert_eq!(component.tracks.len(), 1);
         assert_eq!(component.arcs.len(), 1);
         assert_eq!(component.regions.len(), 2);
-        assert!(component
-            .regions
-            .iter()
-            .any(|region| region.layer == LAYER_MECHANICAL_9));
+        assert!(
+            component
+                .regions
+                .iter()
+                .any(|region| region.layer == LAYER_MECHANICAL_9)
+        );
         assert_eq!(component.bodies.len(), 1);
         assert_eq!(library.models.len(), 1);
     }
@@ -1511,11 +1614,36 @@ mod tests {
         assert_eq!(component.pads.len(), 1);
         assert_eq!(component.pads[0].shape_top, PAD_SHAPE_ROUND);
         assert_eq!(component.regions.len(), 2);
-        assert!(component
-            .regions
-            .iter()
-            .any(|region| region.layer == LAYER_MECHANICAL_9 && region.outline.len() == 6));
+        assert!(
+            component
+                .regions
+                .iter()
+                .any(|region| region.layer == LAYER_MECHANICAL_9 && region.outline.len() == 6)
+        );
         assert_eq!(component.extended_primitive_information.len(), 1);
+    }
+
+    #[test]
+    fn exports_rectangular_poly_pad_as_normal_pad() {
+        let payload = json!({"result": {"dataStr": r#"["DOCTYPE","FOOTPRINT","1.8"]
+["PAD","e8",0,"",1,"1",-28,0.2,0,null,["POLY",[-40.005,9.698,"L",-16.005,9.698,-16.005,-9.302,-40.005,-9.302,-40.005,9.698]],[],-0.005,-0.003,0,1,0,null,null,null,null,0]
+["PAD","e9",0,"",1,"2",28,-0.2,0,null,["POLY",[15.995,9.304,"L",39.995,9.304,39.995,-9.696,15.995,-9.696,15.995,9.304]],[],-0.005,0.004,0,1,0,null,null,null,null,0]"#}});
+        let library = build_pcblib_from_payload(&payload, "SOD-323", None).unwrap();
+        let component = &library.components[0];
+
+        assert_eq!(component.pads.len(), 2);
+        assert!(
+            component
+                .pads
+                .iter()
+                .all(|pad| pad.shape_top == crate::pcblib::PAD_SHAPE_RECTANGULAR)
+        );
+        assert_eq!(component.pads[0].size_top.x, 240_000);
+        assert_eq!(component.pads[0].size_top.y, 190_000);
+        assert_eq!(component.pads[0].location.x, -280_050);
+        assert_eq!(component.pads[0].location.y, 1_980);
+        assert_eq!(component.regions.len(), 2);
+        assert_eq!(component.extended_primitive_information.len(), 0);
     }
 
     #[test]
@@ -1569,10 +1697,12 @@ mod tests {
 
         assert_eq!(component.pads.len(), 0);
         assert_eq!(component.regions.len(), 1);
-        assert!(component
-            .regions
-            .iter()
-            .any(|region| region.layer == LAYER_MULTI && region.outline.len() == 32));
+        assert!(
+            component
+                .regions
+                .iter()
+                .any(|region| region.layer == LAYER_MULTI && region.outline.len() == 32)
+        );
     }
 
     #[test]
@@ -1619,12 +1749,16 @@ mod tests {
 
         assert_eq!(alignment_pads.len(), 2);
         assert_eq!(alignment_arcs.len(), 32);
-        assert!(alignment_pads
-            .iter()
-            .any(|pad| pad.location.x == -1_137_750 && pad.location.y == 513_750));
-        assert!(alignment_pads
-            .iter()
-            .any(|pad| pad.location.x == 1_137_850 && pad.location.y == 513_750));
+        assert!(
+            alignment_pads
+                .iter()
+                .any(|pad| pad.location.x == -1_137_750 && pad.location.y == 513_750)
+        );
+        assert!(
+            alignment_pads
+                .iter()
+                .any(|pad| pad.location.x == 1_137_850 && pad.location.y == 513_750)
+        );
     }
 
     #[test]
