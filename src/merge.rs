@@ -83,12 +83,13 @@ pub(crate) fn read_schlib_records(path: &Path) -> Result<Vec<SchlibRecord>> {
     let explicit_sections = read_schlib_section_keys(&mut compound).unwrap_or_default();
     let mut records = Vec::with_capacity(names.len());
     for (index, name) in names.into_iter().enumerate() {
-        let section_key = explicit_sections
-            .get(&name)
-            .map(String::as_str)
-            .filter(|value| !value.trim().is_empty())
-            .map(ToOwned::to_owned)
-            .unwrap_or_else(|| derived_sections[index].clone());
+        let section_key = resolve_section_key(
+            &mut compound,
+            &name,
+            explicit_sections.get(&name).map(String::as_str),
+            &derived_sections[index],
+            "Data",
+        )?;
         let data = read_stream_bytes(&mut compound, &format!("/{section_key}/Data"))?;
         records.push(parse_schlib_record(name, data)?);
     }
@@ -138,12 +139,13 @@ pub(crate) fn read_pcblib_records(path: &Path) -> Result<PcblibRecordLibrary> {
 
     let mut components = Vec::with_capacity(names.len());
     for (index, name) in names.into_iter().enumerate() {
-        let section_key = explicit_sections
-            .get(&name)
-            .map(String::as_str)
-            .filter(|value| !value.trim().is_empty())
-            .map(ToOwned::to_owned)
-            .unwrap_or_else(|| derived_sections[index].clone());
+        let section_key = resolve_section_key(
+            &mut compound,
+            &name,
+            explicit_sections.get(&name).map(String::as_str),
+            &derived_sections[index],
+            "Header",
+        )?;
         let primitive_count = read_storage_header(
             &mut compound,
             &format!("/{section_key}/Header"),
@@ -467,6 +469,33 @@ fn read_stream_bytes(compound: &mut CompoundFile<File>, path: &str) -> Result<Ve
     Ok(data)
 }
 
+fn resolve_section_key(
+    compound: &mut CompoundFile<File>,
+    name: &str,
+    explicit: Option<&str>,
+    derived: &str,
+    required_stream: &str,
+) -> Result<String> {
+    let candidates = section_key_candidates(name, explicit, derived);
+    for section_key in &candidates {
+        if compound
+            .open_stream(&format!("/{section_key}/{required_stream}"))
+            .is_ok()
+        {
+            return Ok(section_key.clone());
+        }
+    }
+
+    let tried = candidates
+        .iter()
+        .map(|section_key| format!("/{section_key}/{required_stream}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    Err(AppError::Other(format!(
+        "component {name:?} has no {required_stream} stream; tried {tried}"
+    )))
+}
+
 fn first_param_block_pairs(data: &[u8], label: &str) -> Result<Vec<(String, String)>> {
     let mut offset = 0usize;
     let block = read_block(data, &mut offset, label)?;
@@ -637,6 +666,34 @@ fn section_key_from_name(name: &str) -> String {
     } else {
         key
     }
+}
+
+fn legacy_section_key_from_name(name: &str) -> String {
+    if name.is_empty() {
+        return "_".to_string();
+    }
+    name.chars()
+        .take(31)
+        .map(|character| if character == '/' { '_' } else { character })
+        .collect()
+}
+
+fn section_key_candidates(name: &str, explicit: Option<&str>, derived: &str) -> Vec<String> {
+    let mut candidates = Vec::new();
+    if let Some(explicit) = explicit.filter(|value| !value.trim().is_empty()) {
+        push_unique_section_key(&mut candidates, explicit.to_string());
+    }
+    push_unique_section_key(&mut candidates, derived.to_string());
+    push_unique_section_key(&mut candidates, legacy_section_key_from_name(name));
+    push_unique_section_key(&mut candidates, name.to_string());
+    candidates
+}
+
+fn push_unique_section_key(candidates: &mut Vec<String>, value: String) {
+    if value.is_empty() || candidates.iter().any(|existing| existing == &value) {
+        return;
+    }
+    candidates.push(value);
 }
 
 fn write_stream(compound: &mut CompoundFile<File>, path: &str, data: &[u8]) -> std::io::Result<()> {
@@ -969,14 +1026,15 @@ fn pcb_encode_ansi_lossy(text: &str) -> Vec<u8> {
 mod tests {
     use super::{
         normalize_lcsc_id, pcblib_records_from_library, read_pcblib_records, read_schlib_records,
-        schlib_record_from_component, temp_path, write_pcblib_records, write_schlib_records,
+        schlib_file_header_bytes, schlib_record_from_component, schlib_storage_bytes, temp_path,
+        write_pcblib_records, write_schlib_records, write_stream,
     };
     use crate::footprint::build_pcblib_from_payload;
     use crate::schlib::{
         build_component_from_payload_with_metadata, SchlibMetadata, SchlibParameter,
     };
     use serde_json::Value;
-    use std::fs;
+    use std::fs::{self, File};
 
     const STEP_FIXTURE: &[u8] =
         b"ISO-10303-21;\nHEADER;\nENDSEC;\nDATA;\nENDSEC;\nEND-ISO-10303-21;\n";
@@ -1075,6 +1133,51 @@ mod tests {
         assert_eq!(records[0].identity.as_deref(), Some("C2040"));
         assert_eq!(records[1].name, non_ascii_name);
         assert_eq!(records[1].identity.as_deref(), Some("C50387083"));
+        fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn schlib_records_read_legacy_space_section_name_without_section_keys() {
+        let payload: Value =
+            serde_json::from_str(include_str!("../tests/fixtures/easyeda_symbol.json"))
+                .expect("symbol fixture");
+        let name = "0.5-8P CTSJ-H2.0 119";
+        let metadata = SchlibMetadata {
+            description: Some("Legacy space section".to_string()),
+            designator: Some("J?".to_string()),
+            comment: Some(name.to_string()),
+            parameters: vec![SchlibParameter {
+                name: "NPNP_COMPONENT_ID".to_string(),
+                value: "C424242".to_string(),
+            }],
+            footprint_model_name: None,
+            footprint_library_file: None,
+        };
+        let component = build_component_from_payload_with_metadata(&payload, name, &metadata)
+            .expect("build component");
+        let record = schlib_record_from_component(&component).expect("capture SchLib record");
+
+        let path = temp_path("npnp_merge_schlib_legacy_space", "SchLib");
+        let file = File::create(&path).expect("create legacy SchLib");
+        let mut compound = cfb::CompoundFile::create(file).expect("create compound");
+        write_stream(
+            &mut compound,
+            "/FileHeader",
+            &schlib_file_header_bytes(std::slice::from_ref(&record)),
+        )
+        .expect("write header");
+        compound
+            .create_storage(&format!("/{name}/"))
+            .expect("create legacy storage");
+        write_stream(&mut compound, &format!("/{name}/Data"), &record.data).expect("write data");
+        write_stream(&mut compound, "/Storage", &schlib_storage_bytes()).expect("write storage");
+        compound.flush().expect("flush compound");
+        drop(compound);
+
+        let records = read_schlib_records(&path).expect("read legacy SchLib");
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].name, name);
+        assert_eq!(records[0].identity.as_deref(), Some("C424242"));
         fs::remove_file(path).ok();
     }
 
