@@ -15,7 +15,8 @@ const FOOTPRINT_UNIT_TO_MM: f64 = 0.0254;
 const RAW_PER_MIL: f64 = 10_000.0;
 const DEFAULT_GRAPHIC_WIDTH_MM: f64 = 0.05;
 const CIRCLE_SEGMENTS: usize = 32;
-const DEFAULT_CORNER_RADIUS_PERCENTAGE: u8 = 50;
+const ROUNDED_RECT_CORNER_SEGMENTS: usize = 8;
+const DEFAULT_CORNER_RADIUS_PERCENTAGE: u8 = 25;
 const MIN_COMPONENT_BODY_HEIGHT_MM: f64 = 0.2;
 const CUSTOM_PAD_HOTSPOT_UNITS: f64 = 2.3792;
 const DEFAULT_PAD_SOLDER_MASK_EXPANSION_MIL: f64 = 1.969;
@@ -936,7 +937,9 @@ fn map_pad_hole_type(name: &str) -> u8 {
 
 fn map_pad_shape(name: &str, width: f64, height: f64) -> u8 {
     let upper = name.trim().to_ascii_uppercase();
-    if upper.contains("POLY") || upper.contains("RECT") {
+    if upper.contains("RECT") {
+        PAD_SHAPE_ROUNDED_RECTANGLE
+    } else if upper.contains("POLY") {
         PAD_SHAPE_RECTANGULAR
     } else if upper.contains("OCT") {
         PAD_SHAPE_OCTAGONAL
@@ -1422,6 +1425,16 @@ impl Bounds {
 }
 
 fn pad_outline_region(pad: &PadRaw) -> Option<Vec<CoordPoint>> {
+    if map_pad_shape(&pad.shape, pad.width, pad.height) == PAD_SHAPE_ROUNDED_RECTANGLE {
+        return rounded_rect_pad_outline(
+            pad.x,
+            pad.y,
+            pad.width,
+            pad.height,
+            pad.rotation,
+            DEFAULT_CORNER_RADIUS_PERCENTAGE,
+        );
+    }
     if let Some(points) = &pad.polygon_points {
         let mut outline: Vec<CoordPoint> = points.iter().copied().map(raw_point_to_coord).collect();
         if outline.first() != outline.last() {
@@ -1528,6 +1541,102 @@ fn rectangular_pad_outline(
     Some(outline)
 }
 
+fn rounded_rect_pad_outline(
+    center_x: f64,
+    center_y: f64,
+    width: f64,
+    height: f64,
+    rotation_degrees: f64,
+    corner_radius_percentage: u8,
+) -> Option<Vec<CoordPoint>> {
+    if width <= 0.0 || height <= 0.0 {
+        return None;
+    }
+
+    let half_w = width / 2.0;
+    let half_h = height / 2.0;
+    let max_radius = half_w.min(half_h);
+    let radius =
+        (width.min(height) * f64::from(corner_radius_percentage) / 200.0).clamp(0.0, max_radius);
+    if radius <= 1e-9 {
+        return rectangular_pad_outline(center_x, center_y, width, height, rotation_degrees);
+    }
+
+    let angle = normalize_angle(rotation_degrees).to_radians();
+    let (sin, cos) = angle.sin_cos();
+    let mut outline = Vec::with_capacity(ROUNDED_RECT_CORNER_SEGMENTS * 4 + 5);
+
+    let mut push_local = |local_x: f64, local_y: f64| {
+        let x = center_x + local_x * cos - local_y * sin;
+        let y = center_y + local_x * sin + local_y * cos;
+        let point = coord_from_easy_units(x, y);
+        if outline.last().copied() != Some(point) {
+            outline.push(point);
+        }
+    };
+
+    push_local(-half_w + radius, -half_h);
+    push_local(half_w - radius, -half_h);
+    push_rounded_corner(
+        &mut push_local,
+        half_w - radius,
+        -half_h + radius,
+        radius,
+        -90.0,
+        0.0,
+    );
+    push_local(half_w, half_h - radius);
+    push_rounded_corner(
+        &mut push_local,
+        half_w - radius,
+        half_h - radius,
+        radius,
+        0.0,
+        90.0,
+    );
+    push_local(-half_w + radius, half_h);
+    push_rounded_corner(
+        &mut push_local,
+        -half_w + radius,
+        half_h - radius,
+        radius,
+        90.0,
+        180.0,
+    );
+    push_local(-half_w, -half_h + radius);
+    push_rounded_corner(
+        &mut push_local,
+        -half_w + radius,
+        -half_h + radius,
+        radius,
+        180.0,
+        270.0,
+    );
+
+    if let Some(first) = outline.first().copied() {
+        outline.push(first);
+    }
+    Some(outline)
+}
+
+fn push_rounded_corner(
+    push_local: &mut impl FnMut(f64, f64),
+    center_x: f64,
+    center_y: f64,
+    radius: f64,
+    start_degrees: f64,
+    end_degrees: f64,
+) {
+    for step in 1..=ROUNDED_RECT_CORNER_SEGMENTS {
+        let t = step as f64 / ROUNDED_RECT_CORNER_SEGMENTS as f64;
+        let angle = (start_degrees + (end_degrees - start_degrees) * t).to_radians();
+        push_local(
+            center_x + radius * angle.cos(),
+            center_y + radius * angle.sin(),
+        );
+    }
+}
+
 fn pad_shape_region_params(v7_layer: &str) -> Vec<(String, String)> {
     vec![
         ("V7_LAYER".to_string(), v7_layer.to_string()),
@@ -1552,8 +1661,9 @@ fn mask_region_layers(layer_code: i32, hole_mm: f64) -> Vec<(u8, &'static str)> 
 #[cfg(test)]
 mod tests {
     use super::{
-        RawPoint, build_pcblib_from_payload, normalize_footprint_description,
-        parse_path_raw_points, rectangular_pad_outline,
+        DEFAULT_CORNER_RADIUS_PERCENTAGE, ROUNDED_RECT_CORNER_SEGMENTS, RawPoint,
+        build_pcblib_from_payload, normalize_footprint_description, parse_path_raw_points,
+        rectangular_pad_outline,
     };
     use crate::pcblib::{
         LAYER_MECHANICAL_2, LAYER_MECHANICAL_9, LAYER_MULTI, LAYER_TOP_OVERLAY, PAD_HOLE_ROUND,
@@ -1624,7 +1734,7 @@ mod tests {
     }
 
     #[test]
-    fn exports_rectangular_poly_pad_as_normal_pad() {
+    fn exports_rectangular_poly_pad_as_rounded_rectangular_pad() {
         let payload = json!({"result": {"dataStr": r#"["DOCTYPE","FOOTPRINT","1.8"]
 ["PAD","e8",0,"",1,"1",-28,0.2,0,null,["POLY",[-40.005,9.698,"L",-16.005,9.698,-16.005,-9.302,-40.005,-9.302,-40.005,9.698]],[],-0.005,-0.003,0,1,0,null,null,null,null,0]
 ["PAD","e9",0,"",1,"2",28,-0.2,0,null,["POLY",[15.995,9.304,"L",39.995,9.304,39.995,-9.696,15.995,-9.696,15.995,9.304]],[],-0.005,0.004,0,1,0,null,null,null,null,0]"#}});
@@ -1636,13 +1746,33 @@ mod tests {
             component
                 .pads
                 .iter()
-                .all(|pad| pad.shape_top == crate::pcblib::PAD_SHAPE_RECTANGULAR)
+                .all(|pad| pad.shape_top == crate::pcblib::PAD_SHAPE_ROUNDED_RECTANGLE)
+        );
+        assert!(
+            component
+                .pads
+                .iter()
+                .all(|pad| pad.corner_radius_percentage == DEFAULT_CORNER_RADIUS_PERCENTAGE)
         );
         assert_eq!(component.pads[0].size_top.x, 240_000);
         assert_eq!(component.pads[0].size_top.y, 190_000);
         assert_eq!(component.pads[0].location.x, -280_050);
         assert_eq!(component.pads[0].location.y, 1_980);
         assert_eq!(component.regions.len(), 2);
+        assert!(
+            component
+                .regions
+                .iter()
+                .filter(|region| region.layer == LAYER_MECHANICAL_9)
+                .all(|region| region.outline.len() > 5)
+        );
+        assert!(
+            component
+                .regions
+                .iter()
+                .filter(|region| region.layer == LAYER_MECHANICAL_9)
+                .all(|region| region.outline.len() == ROUNDED_RECT_CORNER_SEGMENTS * 4 + 6)
+        );
         assert_eq!(component.extended_primitive_information.len(), 0);
     }
 
