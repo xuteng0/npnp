@@ -15,6 +15,7 @@ const FOOTPRINT_UNIT_TO_MM: f64 = 0.0254;
 const RAW_PER_MIL: f64 = 10_000.0;
 const DEFAULT_GRAPHIC_WIDTH_MM: f64 = 0.05;
 const CIRCLE_SEGMENTS: usize = 32;
+const PATH_ARC_SEGMENT_DEGREES: f64 = 10.0;
 const ROUNDED_RECT_CORNER_SEGMENTS: usize = 8;
 const DEFAULT_CORNER_RADIUS_PERCENTAGE: u8 = 25;
 const MIN_COMPONENT_BODY_HEIGHT_MM: f64 = 0.2;
@@ -1228,6 +1229,59 @@ fn append_corner_arc(
     }
 }
 
+fn append_path_arc_points(points: &mut Vec<RawPoint>, sweep_degrees: f64, end_x: f64, end_y: f64) {
+    let Some(start) = points.last().copied() else {
+        add_raw_point(points, end_x, end_y);
+        return;
+    };
+
+    let sweep_abs = sweep_degrees.abs();
+    let dx = end_x - start.x;
+    let dy = end_y - start.y;
+    let chord = dx.hypot(dy);
+    if chord <= 1e-9 || sweep_abs <= 1e-9 {
+        add_raw_point(points, end_x, end_y);
+        return;
+    }
+
+    let half_sweep = sweep_abs.to_radians() / 2.0;
+    let sin_half = half_sweep.sin();
+    let tan_half = half_sweep.tan();
+    if sin_half.abs() <= 1e-9 || tan_half.abs() <= 1e-9 {
+        add_raw_point(points, end_x, end_y);
+        return;
+    }
+
+    let radius = chord / (2.0 * sin_half.abs());
+    let center_distance = chord / (2.0 * tan_half.abs());
+    let mid_x = (start.x + end_x) / 2.0;
+    let mid_y = (start.y + end_y) / 2.0;
+    let unit_x = dx / chord;
+    let unit_y = dy / chord;
+    let left_x = -unit_y;
+    let left_y = unit_x;
+    let direction = if sweep_degrees >= 0.0 { 1.0 } else { -1.0 };
+    let center_x = mid_x + left_x * center_distance * direction;
+    let center_y = mid_y + left_y * center_distance * direction;
+    let start_angle = (start.y - center_y).atan2(start.x - center_x);
+    let segments = ((sweep_abs / PATH_ARC_SEGMENT_DEGREES).ceil() as usize).max(1);
+
+    for step in 1..=segments {
+        let t = step as f64 / segments as f64;
+        let angle = start_angle + sweep_degrees.to_radians() * t;
+        add_raw_point(
+            points,
+            center_x + radius * angle.cos(),
+            center_y + radius * angle.sin(),
+        );
+    }
+
+    if let Some(last) = points.last_mut() {
+        last.x = end_x;
+        last.y = end_y;
+    }
+}
+
 fn parse_path_raw_points(shape: &Value) -> Vec<RawPoint> {
     let Some(array) = shape.as_array() else {
         return Vec::new();
@@ -1272,11 +1326,13 @@ fn parse_path_raw_points(shape: &Value) -> Vec<RawPoint> {
                 add_axis_aligned_rect_points(&mut points, x, y, width, height, radius);
                 i += 5;
             } else if command == "ARC" || command == "A" {
-                if i + 2 < array.len() && value_f64(array.get(i)).is_some() {
-                    if let (Some(x), Some(y)) =
-                        (value_f64(array.get(i + 1)), value_f64(array.get(i + 2)))
-                    {
-                        add_raw_point(&mut points, x, y);
+                if i + 2 < array.len() {
+                    if let (Some(sweep), Some(x), Some(y)) = (
+                        value_f64(array.get(i)),
+                        value_f64(array.get(i + 1)),
+                        value_f64(array.get(i + 2)),
+                    ) {
+                        append_path_arc_points(&mut points, sweep, x, y);
                         i += 3;
                     }
                 }
@@ -1925,6 +1981,52 @@ mod tests {
                     y: 35.0
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn expands_easyeda_path_arc_commands() {
+        let shape = json!([0, 0, "ARC", 180, 10, 0]);
+        let points = parse_path_raw_points(&shape);
+
+        assert!(points.len() > 3);
+        assert_eq!(points.first(), Some(&RawPoint { x: 0.0, y: 0.0 }));
+        assert_eq!(points.last(), Some(&RawPoint { x: 10.0, y: 0.0 }));
+        assert!(
+            points
+                .iter()
+                .skip(1)
+                .take(points.len().saturating_sub(2))
+                .any(|point| point.y.abs() > 1.0)
+        );
+    }
+
+    #[test]
+    fn expands_c41430892_top_overlay_arc_instead_of_chord() {
+        let shape = json!([285.274, 177.846, "ARC", 90, 2.486, 460.634]);
+        let points = parse_path_raw_points(&shape);
+
+        assert!(points.len() > 3);
+        assert_eq!(
+            points.first(),
+            Some(&RawPoint {
+                x: 285.274,
+                y: 177.846
+            })
+        );
+        assert_eq!(
+            points.last(),
+            Some(&RawPoint {
+                x: 2.486,
+                y: 460.634
+            })
+        );
+        assert!(
+            points
+                .iter()
+                .skip(1)
+                .take(points.len().saturating_sub(2))
+                .any(|point| point.x > 2.486 && point.x < 285.274 && point.y > 177.846)
         );
     }
 }
