@@ -10,6 +10,7 @@ use tokio::task::JoinSet;
 
 use crate::error::{AppError, Result};
 use crate::lceda::{LcedaClient, SearchItem};
+use crate::lcsc::LcscClient;
 use crate::merge::{
     PcblibRecordLibrary, SchlibRecord, normalize_lcsc_id, pcblib_records_from_library,
     read_pcblib_records, read_schlib_records, schlib_record_from_component, write_pcblib_records,
@@ -18,8 +19,8 @@ use crate::merge::{
 use crate::pcblib::{PcbLibrary, write_pcblib};
 use crate::util::sanitize_filename;
 use crate::workflow::{
-    build_pcblib_library_for_item, build_schlib_component_for_item, export_pcblib, export_schlib,
-    resolved_footprint_name,
+    build_pcblib_library_for_item, build_schlib_component_for_item_with_metadata, export_pcblib,
+    export_schlib_with_options, resolved_footprint_name,
 };
 
 #[derive(Debug, Clone)]
@@ -34,6 +35,7 @@ pub struct BatchOptions {
     pub library_name: Option<String>,
     pub parallel: usize,
     pub continue_on_error: bool,
+    pub lcsc_english: bool,
     pub force: bool,
 }
 
@@ -404,6 +406,7 @@ async fn export_batch_merged_fresh(
             &mut used_symbol_names,
             &mut used_footprint_names,
             &merged_pcblib_file,
+            options.lcsc_english,
         )
         .await
         {
@@ -542,6 +545,7 @@ async fn export_batch_merged_append(
             &mut used_symbol_names,
             &mut used_footprint_names,
             &merged_pcblib_file,
+            options.lcsc_english,
         )
         .await
         {
@@ -551,7 +555,10 @@ async fn export_batch_merged_append(
                     schlib_records.push(record);
                 }
                 if let Some(library) = artifacts.pcblib_library {
-                    append_pcblib_library(&mut pcblib_library, pcblib_records_from_library(&library)?);
+                    append_pcblib_library(
+                        &mut pcblib_library,
+                        pcblib_records_from_library(&library)?,
+                    );
                 }
                 summary.success += 1;
                 added_any = true;
@@ -626,6 +633,7 @@ async fn export_merged_component(
     used_symbol_names: &mut HashSet<String>,
     used_footprint_names: &mut HashSet<String>,
     merged_pcblib_file: &str,
+    lcsc_english: bool,
 ) -> Result<MergeArtifacts> {
     let item = client.select_item(lcsc_id, 1).await?;
     let component_name = merged_symbol_component_name(&item, lcsc_id, used_symbol_names);
@@ -642,12 +650,18 @@ async fn export_merged_component(
     };
 
     let schlib_record = if targets.schlib {
-        let component = build_schlib_component_for_item(
+        let english_metadata = if lcsc_english {
+            Some(LcscClient::new().product_detail(&identity).await?)
+        } else {
+            None
+        };
+        let component = build_schlib_component_for_item_with_metadata(
             client,
             &item,
             &component_name,
             Some(&footprint_name),
             Some(merged_pcblib_file),
+            english_metadata.as_ref(),
         )
         .await?;
         Some(schlib_record_from_component(&component)?)
@@ -855,7 +869,14 @@ async fn export_component(
 
     if targets.schlib {
         let schlib_dir = options.output.join("schlib");
-        export_schlib(client, &item, &schlib_dir, options.force).await?;
+        export_schlib_with_options(
+            client,
+            &item,
+            &schlib_dir,
+            options.force,
+            options.lcsc_english,
+        )
+        .await?;
     }
 
     if targets.pcblib {
@@ -980,6 +1001,7 @@ mod tests {
             library_name: None,
             parallel: 1,
             continue_on_error: false,
+            lcsc_english: false,
             force: false,
         };
 

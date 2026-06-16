@@ -63,6 +63,9 @@ pub enum Commands {
         index: usize,
         #[arg(long, default_value = "schlib")]
         output: PathBuf,
+        /// Use English product metadata from lcsc.com for SchLib parameters/description
+        #[arg(long)]
+        lcsc_english: bool,
         #[arg(long)]
         force: bool,
     },
@@ -109,6 +112,9 @@ pub enum Commands {
         parallel: usize,
         #[arg(long)]
         continue_on_error: bool,
+        /// Use English product metadata from lcsc.com for SchLib parameters/description
+        #[arg(long)]
+        lcsc_english: bool,
         #[arg(long)]
         force: bool,
     },
@@ -135,5 +141,15 @@ mod tests {
         };
         assert_eq!(keyword, "C2040");
         assert_eq!(limit, 20);
+    }
+
+    #[test]
+    fn parses_lcsc_english_schlib_flag() {
+        let cli = Cli::try_parse_from(["npnp", "export-schlib", "C2927505", "--lcsc-english"])
+            .expect("export-schlib command should parse");
+        let Some(Commands::ExportSchlib { lcsc_english, .. }) = cli.command else {
+            panic!("expected export-schlib command");
+        };
+        assert!(lcsc_english);
     }
 }
