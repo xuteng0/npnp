@@ -3,6 +3,8 @@ use std::fs::File;
 use std::io::Write;
 use std::path::Path;
 
+use encoding_rs::WINDOWS_1252;
+
 use crate::error::Result;
 
 const LIBRARY_DATA_TEMPLATE: &str = include_str!("pcblib_library_data_template.txt");
@@ -987,6 +989,13 @@ impl Params {
             text.push_str(key);
             text.push('=');
             text.push_str(value);
+            if requires_utf8_parameter(value) {
+                text.push('|');
+                text.push_str("%UTF8%");
+                text.push_str(key);
+                text.push('=');
+                text.push_str(&encode_utf8_parameter_value(value));
+            }
         }
         text
     }
@@ -1069,17 +1078,20 @@ impl BinaryWriter {
 }
 
 fn encode_ansi_lossy(text: &str) -> Vec<u8> {
-    text.chars()
-        .map(|character| {
-            if character == '\0' {
-                b'?'
-            } else if (character as u32) <= 0xFF {
-                character as u8
-            } else {
-                b'?'
-            }
-        })
-        .collect()
+    let sanitized = text.replace('\0', "?");
+    let (bytes, _, _) = WINDOWS_1252.encode(&sanitized);
+    bytes.into_owned()
+}
+
+fn requires_utf8_parameter(text: &str) -> bool {
+    let (_, _, had_errors) = WINDOWS_1252.encode(text);
+    had_errors
+}
+
+fn encode_utf8_parameter_value(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let (value, _, _) = WINDOWS_1252.decode(bytes);
+    value.into_owned()
 }
 
 #[cfg(test)]

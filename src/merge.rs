@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use cfb::CompoundFile;
-use encoding_rs::GBK;
+use encoding_rs::WINDOWS_1252;
 
 use crate::error::{AppError, Result};
 use crate::pcblib::{write_pcblib, PcbLibrary};
@@ -531,11 +531,18 @@ fn param_value<'a>(pairs: &'a [(String, String)], key: &str) -> Option<&'a str> 
 }
 
 fn parse_param_pairs(text: &str) -> Vec<(String, String)> {
-    text.split('|')
-        .filter(|segment| !segment.is_empty())
-        .filter_map(|segment| segment.split_once('='))
-        .map(|(name, value)| (name.to_string(), value.to_string()))
-        .collect()
+    let mut pairs = Vec::new();
+    for segment in text.split('|').filter(|segment| !segment.is_empty()) {
+        let Some((name, value)) = segment.split_once('=') else {
+            continue;
+        };
+        if let Some(key) = name.strip_prefix("%UTF8%") {
+            pairs.push((key.to_string(), decode_utf8_parameter_value(value)));
+        } else {
+            pairs.push((name.to_string(), value.to_string()));
+        }
+    }
+    pairs
 }
 
 fn cstring_text(data: &[u8]) -> String {
@@ -543,7 +550,8 @@ fn cstring_text(data: &[u8]) -> String {
         .iter()
         .position(|byte| *byte == 0)
         .unwrap_or(data.len());
-    String::from_utf8_lossy(&data[..len]).into_owned()
+    let (text, _, _) = WINDOWS_1252.decode(&data[..len]);
+    text.into_owned()
 }
 
 fn schlib_cstring_text(data: &[u8]) -> String {
@@ -551,8 +559,13 @@ fn schlib_cstring_text(data: &[u8]) -> String {
         .iter()
         .position(|byte| *byte == 0)
         .unwrap_or(data.len());
-    let (text, _, _) = GBK.decode(&data[..len]);
+    let (text, _, _) = WINDOWS_1252.decode(&data[..len]);
     text.into_owned()
+}
+
+fn decode_utf8_parameter_value(text: &str) -> String {
+    let (bytes, _, _) = WINDOWS_1252.encode(text);
+    String::from_utf8_lossy(&bytes).into_owned()
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -887,6 +900,13 @@ impl SchParams {
             text.push_str(key);
             text.push('=');
             text.push_str(value);
+            if requires_utf8_parameter(value) {
+                text.push('|');
+                text.push_str("%UTF8%");
+                text.push_str(key);
+                text.push('=');
+                text.push_str(&encode_utf8_parameter_value(value));
+            }
         }
         text
     }
@@ -946,7 +966,7 @@ impl SchWriter {
 
 fn sch_encode_ansi_lossy(text: &str) -> Vec<u8> {
     let sanitized = text.replace('\0', "?");
-    let (bytes, _, _) = GBK.encode(&sanitized);
+    let (bytes, _, _) = WINDOWS_1252.encode(&sanitized);
     bytes.into_owned()
 }
 
@@ -1009,17 +1029,20 @@ impl PcbWriter {
 }
 
 fn pcb_encode_ansi_lossy(text: &str) -> Vec<u8> {
-    text.chars()
-        .map(|character| {
-            if character == '\0' {
-                b'?'
-            } else if (character as u32) <= 0xFF {
-                character as u8
-            } else {
-                b'?'
-            }
-        })
-        .collect()
+    let sanitized = text.replace('\0', "?");
+    let (bytes, _, _) = WINDOWS_1252.encode(&sanitized);
+    bytes.into_owned()
+}
+
+fn requires_utf8_parameter(text: &str) -> bool {
+    let (_, _, had_errors) = WINDOWS_1252.encode(text);
+    had_errors
+}
+
+fn encode_utf8_parameter_value(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let (value, _, _) = WINDOWS_1252.decode(bytes);
+    value.into_owned()
 }
 
 #[cfg(test)]
