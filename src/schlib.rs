@@ -415,7 +415,7 @@ fn build_component(
                     orientation: pin_orientation_from_easyeda_rotation(pin.rotation_degrees),
                     show_name: pin.show_name,
                     show_designator: pin.show_designator,
-                    color_bgr: common::RED_BGR,
+                    color_bgr: common::SYMBOL_BGR,
                     owner_part_id: 1,
                     owner_part_display_mode: 0,
                 });
@@ -472,7 +472,7 @@ fn build_component(
                         common::CoordPoint::from_symbol_units(point.x_units, point.y_units)
                     })
                     .collect(),
-                color_bgr: common::RED_BGR,
+                color_bgr: common::SYMBOL_BGR,
                 line_width_index: GRAPHIC_LINE_WIDTH_INDEX,
                 owner_part_id: polyline.owner_part_id,
             });
@@ -488,7 +488,7 @@ fn build_component(
                         common::CoordPoint::from_symbol_units(arc.mid.x_units, arc.mid.y_units),
                         common::CoordPoint::from_symbol_units(arc.end.x_units, arc.end.y_units),
                     ],
-                    color_bgr: common::RED_BGR,
+                    color_bgr: common::SYMBOL_BGR,
                     line_width_index: GRAPHIC_LINE_WIDTH_INDEX,
                     owner_part_id: arc.owner_part_id,
                 });
@@ -503,9 +503,9 @@ fn build_component(
                 ),
                 radius_x_raw: common::raw_from_symbol_units(ellipse.radius_x_units),
                 radius_y_raw: common::raw_from_symbol_units(ellipse.radius_y_units),
-                color_bgr: common::RED_BGR,
+                color_bgr: common::SYMBOL_BGR,
                 fill_color_bgr: if ellipse.is_filled {
-                    common::RED_BGR
+                    common::SYMBOL_BGR
                 } else {
                     WHITE_BGR
                 },
@@ -521,7 +521,7 @@ fn build_component(
                 text: label.text.clone(),
                 location: common::CoordPoint::from_symbol_units(label.x_units, label.y_units),
                 orientation: text_orientation_from_rotation(label.rotation_degrees),
-                color_bgr: common::RED_BGR,
+                color_bgr: common::SYMBOL_BGR,
                 owner_part_id: label.owner_part_id,
             });
             has_any_body = true;
@@ -559,7 +559,7 @@ fn build_component(
                 orientation,
                 show_name,
                 show_designator,
-                color_bgr: common::RED_BGR,
+                color_bgr: common::SYMBOL_BGR,
                 owner_part_id: pin.owner_part_id,
                 owner_part_display_mode: 0,
             });
@@ -1548,7 +1548,7 @@ fn arc_from_raw(raw: &ArcRaw) -> Option<Arc> {
         radius_raw: common::raw_from_symbol_units(radius),
         start_angle,
         end_angle,
-        color_bgr: common::RED_BGR,
+        color_bgr: common::SYMBOL_BGR,
         line_width_index: GRAPHIC_LINE_WIDTH_INDEX,
         owner_part_id: raw.owner_part_id,
     })
