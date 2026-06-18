@@ -8,8 +8,8 @@ use cfb::CompoundFile;
 use encoding_rs::WINDOWS_1252;
 
 use crate::error::{AppError, Result};
-use crate::pcblib::{write_pcblib, PcbLibrary};
-use crate::schlib::{write_schlib_library, Component};
+use crate::pcblib::{PcbLibrary, write_pcblib};
+use crate::schlib::{Component, write_schlib_library};
 
 const PCBLIB_LIBRARY_DATA_TEMPLATE: &str = include_str!("pcblib_library_data_template.txt");
 
@@ -674,11 +674,7 @@ fn section_key_from_name(name: &str) -> String {
             key.push('_');
         }
     }
-    if key.is_empty() {
-        "_".to_string()
-    } else {
-        key
-    }
+    if key.is_empty() { "_".to_string() } else { key }
 }
 
 fn legacy_section_key_from_name(name: &str) -> String {
@@ -1054,7 +1050,7 @@ mod tests {
     };
     use crate::footprint::build_pcblib_from_payload;
     use crate::schlib::{
-        build_component_from_payload_with_metadata, SchlibMetadata, SchlibParameter,
+        SchlibMetadata, SchlibParameter, build_component_from_payload_with_metadata,
     };
     use serde_json::Value;
     use std::fs::{self, File};

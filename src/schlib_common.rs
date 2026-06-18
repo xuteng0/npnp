@@ -773,11 +773,7 @@ fn ascii_section_key_from_name(name: &str) -> String {
             key.push('_');
         }
     }
-    if key.is_empty() {
-        "_".to_string()
-    } else {
-        key
-    }
+    if key.is_empty() { "_".to_string() } else { key }
 }
 
 #[derive(Debug, Clone)]
@@ -1016,10 +1012,8 @@ impl BinaryWriter {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_component, write_schlib_from_payload, FILL_BGR};
-    use crate::schlib::{
-        write_schlib_from_payload_with_metadata, SchlibMetadata, SchlibParameter,
-    };
+    use super::{FILL_BGR, build_component, write_schlib_from_payload};
+    use crate::schlib::{SchlibMetadata, SchlibParameter, write_schlib_from_payload_with_metadata};
     use encoding_rs::GBK;
     use serde_json::json;
     use std::fs::{self, File};
@@ -1115,20 +1109,24 @@ mod tests {
         use std::io::Read;
         data_stream.read_to_end(&mut data).unwrap();
 
-        assert!(data
-            .windows(b"|TEXT=DORABO(&#22320;&#21338;&#30005;&#27668;)".len())
-            .any(|window| window == b"|TEXT=DORABO(&#22320;&#21338;&#30005;&#27668;)"));
+        assert!(
+            data.windows(b"|TEXT=DORABO(&#22320;&#21338;&#30005;&#27668;)".len())
+                .any(|window| window == b"|TEXT=DORABO(&#22320;&#21338;&#30005;&#27668;)")
+        );
 
         let mut utf8_field = b"|%UTF8%TEXT=".to_vec();
         utf8_field.extend_from_slice("DORABO(地博电气)".as_bytes());
-        assert!(data
-            .windows(utf8_field.len())
-            .any(|window| window == utf8_field.as_slice()));
+        assert!(
+            data.windows(utf8_field.len())
+                .any(|window| window == utf8_field.as_slice())
+        );
 
         let (gbk_bytes, _, _) = GBK.encode("DORABO(地博电气)");
-        assert!(!data
-            .windows(gbk_bytes.len())
-            .any(|window| window == gbk_bytes.as_ref()));
+        assert!(
+            !data
+                .windows(gbk_bytes.len())
+                .any(|window| window == gbk_bytes.as_ref())
+        );
 
         fs::remove_file(path).ok();
     }

@@ -392,11 +392,7 @@ pub fn section_key_from_name(name: &str) -> String {
             key.push('_');
         }
     }
-    if key.is_empty() {
-        "_".to_string()
-    } else {
-        key
-    }
+    if key.is_empty() { "_".to_string() } else { key }
 }
 
 fn file_header_bytes(_library: &PcbLibrary) -> Vec<u8> {
@@ -892,11 +888,7 @@ fn fnv1a64(bytes: &[u8]) -> u64 {
 }
 
 fn bool_text(value: bool) -> &'static str {
-    if value {
-        "TRUE"
-    } else {
-        "FALSE"
-    }
+    if value { "TRUE" } else { "FALSE" }
 }
 fn format_decimal(value: f64) -> String {
     format!("{value:.3}")
@@ -1245,9 +1237,11 @@ mod tests {
             extended[rounded_shapes_offset + 31],
             PAD_SHAPE_ROUNDED_RECTANGLE
         );
-        assert!(extended[corner_radius_offset..]
-            .iter()
-            .all(|value| *value == 50));
+        assert!(
+            extended[corner_radius_offset..]
+                .iter()
+                .all(|value| *value == 50)
+        );
     }
 
     fn last_block_payload(bytes: &[u8]) -> &[u8] {

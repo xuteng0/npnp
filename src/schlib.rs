@@ -1897,21 +1897,29 @@ mod tests {
     fn schematic_graphics_use_black_outline_colors() {
         let component = build_component_from_payload(&sample_payload(), "TEST/COMP").unwrap();
 
-        assert!(component
-            .rectangles
-            .iter()
-            .all(|item| item.color_bgr == common::SYMBOL_BGR));
-        assert!(component
-            .polylines
-            .iter()
-            .all(|item| item.color_bgr == common::SYMBOL_BGR));
-        assert!(component
-            .labels
-            .iter()
-            .all(|item| item.color_bgr == common::SYMBOL_BGR));
-        assert!(component
-            .pins
-            .iter()
-            .all(|item| item.color_bgr == common::SYMBOL_BGR));
+        assert!(
+            component
+                .rectangles
+                .iter()
+                .all(|item| item.color_bgr == common::SYMBOL_BGR)
+        );
+        assert!(
+            component
+                .polylines
+                .iter()
+                .all(|item| item.color_bgr == common::SYMBOL_BGR)
+        );
+        assert!(
+            component
+                .labels
+                .iter()
+                .all(|item| item.color_bgr == common::SYMBOL_BGR)
+        );
+        assert!(
+            component
+                .pins
+                .iter()
+                .all(|item| item.color_bgr == common::SYMBOL_BGR)
+        );
     }
 }
