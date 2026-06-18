@@ -9,7 +9,7 @@ use crate::error::Result;
 use crate::lceda::LcedaClient;
 use crate::workflow::{
     download_obj, download_step, export_bundle, export_easyeda_sources, export_pcblib,
-    export_schlib,
+    export_schlib_with_options,
 };
 
 pub async fn run_from_env() -> i32 {
@@ -115,10 +115,12 @@ pub async fn run_cli(cli: Cli, invoked_as: &str) -> Result<()> {
             keyword,
             index,
             output,
+            lcsc_english,
             force,
         } => {
             let item = client.select_item(&keyword, index).await?;
-            let path = export_schlib(&client, &item, &output, force).await?;
+            let path =
+                export_schlib_with_options(&client, &item, &output, force, lcsc_english).await?;
             println!("SchLib saved: {}", path.display());
         }
         Commands::ExportPcblib {
@@ -163,6 +165,7 @@ pub async fn run_cli(cli: Cli, invoked_as: &str) -> Result<()> {
             library_name,
             parallel,
             continue_on_error,
+            lcsc_english,
             force,
         } => {
             let summary = export_batch(
@@ -178,6 +181,7 @@ pub async fn run_cli(cli: Cli, invoked_as: &str) -> Result<()> {
                     library_name,
                     parallel,
                     continue_on_error,
+                    lcsc_english,
                     force,
                 },
             )

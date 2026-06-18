@@ -9,7 +9,7 @@ use crate::pcblib::{
     PcbComponentBody, PcbExtendedPrimitiveInfo, PcbLibrary, PcbModel, PcbPad, PcbRegion, PcbTrack,
     stable_guid,
 };
-use crate::util::{nested_string, sanitize_filename};
+use crate::util::{nested_string, sanitize_filename, value_to_string};
 
 const FOOTPRINT_UNIT_TO_MM: f64 = 0.0254;
 const RAW_PER_MIL: f64 = 10_000.0;
@@ -1080,12 +1080,7 @@ fn value_f64(value: Option<&Value>) -> Option<f64> {
     }
 }
 fn value_string(value: Option<&Value>) -> Option<String> {
-    match value? {
-        Value::String(text) => Some(text.clone()),
-        Value::Number(number) => Some(number.to_string()),
-        Value::Bool(flag) => Some(flag.to_string()),
-        _ => None,
-    }
+    value.and_then(value_to_string)
 }
 
 fn try_parse_circle_shape(shape: &Value) -> Option<CircleShape> {

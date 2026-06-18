@@ -4,7 +4,7 @@ use std::fs::File;
 use std::io::Write;
 use std::path::Path;
 
-use encoding_rs::GBK;
+use encoding_rs::WINDOWS_1252;
 use serde_json::Value;
 
 use crate::error::{AppError, Result};
@@ -13,8 +13,9 @@ use crate::util::{nested_string, value_to_string};
 const RAW_PER_DXP_UNIT: f64 = 100_000.0;
 const GRID_UNITS: f64 = 10.0;
 const PIN_LENGTH_UNITS: f64 = 20.0;
-pub(super) const BORDER_BGR: i32 = 0x8080F0;
+pub(super) const BORDER_BGR: i32 = SYMBOL_BGR;
 pub(super) const FILL_BGR: i32 = 0xE0FFFF;
+pub(super) const SYMBOL_BGR: i32 = 0x000000;
 pub(super) const RED_BGR: i32 = 0x0000FF;
 const BLUE_BGR: i32 = 0xFF0000;
 
@@ -147,7 +148,7 @@ fn build_component(payload: &Value, component_name: &str) -> Result<Component> {
                 orientation: pin_orientation_from_rotation(pin.rotation_degrees),
                 show_name: pin.show_name,
                 show_designator: true,
-                color_bgr: RED_BGR,
+                color_bgr: SYMBOL_BGR,
             });
         }
         return Ok(component);
@@ -203,7 +204,7 @@ fn build_component(payload: &Value, component_name: &str) -> Result<Component> {
             orientation: pin_orientation_from_rotation(pin.rotation_degrees),
             show_name,
             show_designator,
-            color_bgr: RED_BGR,
+            color_bgr: SYMBOL_BGR,
         });
     }
 
@@ -745,8 +746,19 @@ pub(super) fn dxp_i16(raw: i64) -> i16 {
 
 fn encode_ansi_lossy(text: &str) -> Vec<u8> {
     let sanitized = text.replace(' ', "?");
-    let (bytes, _, _) = GBK.encode(&sanitized);
+    let (bytes, _, _) = WINDOWS_1252.encode(&sanitized);
     bytes.into_owned()
+}
+
+fn requires_utf8_parameter(text: &str) -> bool {
+    let (_, _, had_errors) = WINDOWS_1252.encode(text);
+    had_errors
+}
+
+fn encode_utf8_parameter_value(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let (value, _, _) = WINDOWS_1252.decode(bytes);
+    value.into_owned()
 }
 
 fn ascii_section_key_from_name(name: &str) -> String {
@@ -945,6 +957,13 @@ impl Params {
             text.push_str(key);
             text.push('=');
             text.push_str(value);
+            if requires_utf8_parameter(value) {
+                text.push('|');
+                text.push_str("%UTF8%");
+                text.push_str(key);
+                text.push('=');
+                text.push_str(&encode_utf8_parameter_value(value));
+            }
         }
         text
     }
@@ -998,6 +1017,10 @@ impl BinaryWriter {
 #[cfg(test)]
 mod tests {
     use super::{build_component, write_schlib_from_payload, FILL_BGR};
+    use crate::schlib::{
+        write_schlib_from_payload_with_metadata, SchlibMetadata, SchlibParameter,
+    };
+    use encoding_rs::GBK;
     use serde_json::json;
     use std::fs::{self, File};
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -1064,6 +1087,48 @@ mod tests {
             .position(|window| window == [1u8, b'A', 1u8, b'1', 0u8, 0u8, 0u8])
             .unwrap();
         assert!(rect_index < pin_text_index);
+
+        fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn writes_utf8_companion_for_chinese_parameters() {
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("npnp_schlib_utf8_{timestamp}.SchLib"));
+        let metadata = SchlibMetadata {
+            parameters: vec![SchlibParameter {
+                name: "Manufacturer".to_string(),
+                value: "DORABO(地博电气)".to_string(),
+            }],
+            ..SchlibMetadata::default()
+        };
+
+        write_schlib_from_payload_with_metadata(&sample_payload(), "TEST", &metadata, &path)
+            .unwrap();
+        let file = File::open(&path).unwrap();
+        let mut compound = cfb::CompoundFile::open(file).unwrap();
+        let mut data_stream = compound.open_stream("/TEST/Data").unwrap();
+        let mut data = Vec::new();
+        use std::io::Read;
+        data_stream.read_to_end(&mut data).unwrap();
+
+        assert!(data
+            .windows(b"|TEXT=DORABO(&#22320;&#21338;&#30005;&#27668;)".len())
+            .any(|window| window == b"|TEXT=DORABO(&#22320;&#21338;&#30005;&#27668;)"));
+
+        let mut utf8_field = b"|%UTF8%TEXT=".to_vec();
+        utf8_field.extend_from_slice("DORABO(地博电气)".as_bytes());
+        assert!(data
+            .windows(utf8_field.len())
+            .any(|window| window == utf8_field.as_slice()));
+
+        let (gbk_bytes, _, _) = GBK.encode("DORABO(地博电气)");
+        assert!(!data
+            .windows(gbk_bytes.len())
+            .any(|window| window == gbk_bytes.as_ref()));
 
         fs::remove_file(path).ok();
     }
