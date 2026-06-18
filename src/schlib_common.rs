@@ -13,7 +13,7 @@ use crate::util::{nested_string, value_to_string};
 const RAW_PER_DXP_UNIT: f64 = 100_000.0;
 const GRID_UNITS: f64 = 10.0;
 const PIN_LENGTH_UNITS: f64 = 20.0;
-pub(super) const BORDER_BGR: i32 = 0x8080F0;
+pub(super) const BORDER_BGR: i32 = SYMBOL_BGR;
 pub(super) const FILL_BGR: i32 = 0xE0FFFF;
 pub(super) const SYMBOL_BGR: i32 = 0x000000;
 pub(super) const RED_BGR: i32 = 0x0000FF;

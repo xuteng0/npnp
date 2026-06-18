@@ -1778,6 +1778,7 @@ mod tests {
         SchlibMetadata, SchlibParameter, build_component_from_payload,
         write_schlib_from_payload_with_metadata, write_schlib_library,
     };
+    use crate::schlib::common;
     use serde_json::json;
     use std::fs::File;
     use std::io::Read;
@@ -1890,5 +1891,27 @@ mod tests {
         assert!(compound.open_stream(&format!("/{second_key}/Data")).is_ok());
 
         std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn schematic_graphics_use_black_outline_colors() {
+        let component = build_component_from_payload(&sample_payload(), "TEST/COMP").unwrap();
+
+        assert!(component
+            .rectangles
+            .iter()
+            .all(|item| item.color_bgr == common::SYMBOL_BGR));
+        assert!(component
+            .polylines
+            .iter()
+            .all(|item| item.color_bgr == common::SYMBOL_BGR));
+        assert!(component
+            .labels
+            .iter()
+            .all(|item| item.color_bgr == common::SYMBOL_BGR));
+        assert!(component
+            .pins
+            .iter()
+            .all(|item| item.color_bgr == common::SYMBOL_BGR));
     }
 }
