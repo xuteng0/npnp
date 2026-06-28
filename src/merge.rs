@@ -1080,6 +1080,7 @@ mod tests {
                 }],
                 footprint_model_name: None,
                 footprint_library_file: None,
+                name_override: None,
             };
             build_component_from_payload_with_metadata(&payload, name, &metadata)
                 .expect("build component")
@@ -1119,6 +1120,7 @@ mod tests {
             }],
             footprint_model_name: None,
             footprint_library_file: None,
+            name_override: None,
         };
         let ascii_metadata = SchlibMetadata {
             description: Some("ASCII component".to_string()),
@@ -1130,6 +1132,7 @@ mod tests {
             }],
             footprint_model_name: None,
             footprint_library_file: None,
+            name_override: None,
         };
         let ascii_component =
             build_component_from_payload_with_metadata(&payload, "COMP_A", &ascii_metadata)
@@ -1171,6 +1174,7 @@ mod tests {
             }],
             footprint_model_name: None,
             footprint_library_file: None,
+            name_override: None,
         };
         let component = build_component_from_payload_with_metadata(&payload, name, &metadata)
             .expect("build component");

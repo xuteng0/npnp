@@ -25,6 +25,7 @@ pub struct SchlibMetadata {
     pub parameters: Vec<SchlibParameter>,
     pub footprint_model_name: Option<String>,
     pub footprint_library_file: Option<String>,
+    pub name_override: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -1754,6 +1755,12 @@ pub struct Component {
     labels: Vec<Label>,
 }
 
+impl Component {
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+}
+
 #[derive(Debug)]
 struct Implementation {
     description: Option<String>,
@@ -1821,6 +1828,7 @@ mod tests {
             ],
             footprint_model_name: Some("LQFN-56_L7.0-W7.0-P0.4-EP".to_string()),
             footprint_library_file: Some("MyLib.PcbLib".to_string()),
+            name_override: None,
         };
 
         write_schlib_from_payload_with_metadata(&sample_payload(), "TEST/COMP", &metadata, &path)
