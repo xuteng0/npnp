@@ -9,6 +9,7 @@ use crate::error::{AppError, Result};
 use crate::footprint::build_pcblib_from_payload;
 use crate::lceda::{LcedaClient, SearchItem};
 use crate::lcsc::{LcscClient, LcscProduct};
+use crate::passive_naming::build_passive_component_name;
 use crate::pcblib::{PcbLibrary, write_pcblib};
 use crate::schlib::{
     Component, SchlibMetadata, SchlibParameter, build_component_from_payload_with_metadata,
@@ -205,7 +206,11 @@ fn build_schlib_component_from_detail(
         footprint_library_file,
         english_metadata,
     );
-    build_component_from_payload_with_metadata(symbol_data, component_name, &metadata)
+    let effective_name = metadata
+        .name_override
+        .as_deref()
+        .unwrap_or(component_name);
+    build_component_from_payload_with_metadata(symbol_data, effective_name, &metadata)
 }
 
 pub async fn build_pcblib_library_for_item(
@@ -304,11 +309,6 @@ pub async fn export_schlib_with_options(
         .ok_or(AppError::MissingSymbolOrFootprint)?;
     let symbol_data = client.component_detail(&symbol_uuid).await?;
     let component_name = resolved_symbol_component_name(item, &symbol_data);
-    let out_file = out_dir.join(format!("{}.SchLib", sanitize_filename(&component_name)));
-    if out_file.exists() && !force {
-        return Ok(out_file);
-    }
-
     let (footprint_model_name, footprint_library_file) =
         if let Some(footprint_uuid) = item.footprint_uuid() {
             let footprint_data = client.component_detail(&footprint_uuid).await?;
@@ -337,6 +337,10 @@ pub async fn export_schlib_with_options(
         footprint_library_file.as_deref(),
         english_metadata.as_ref(),
     )?;
+    let out_file = out_dir.join(format!("{}.SchLib", sanitize_filename(component.name())));
+    if out_file.exists() && !force {
+        return Ok(out_file);
+    }
     write_schlib(&component, &out_file)?;
     Ok(out_file)
 }
@@ -458,6 +462,13 @@ fn build_schlib_metadata(
         }
     }
 
+    let designator_raw = first_non_empty([nested_string(&item.raw, &["attributes", "Designator"])]);
+    let name_override = build_passive_component_name(
+        designator_raw.as_deref().unwrap_or(""),
+        &parameters,
+        item.lcsc_id().as_deref(),
+    );
+
     SchlibMetadata {
         description: english_metadata
             .and_then(|product| product.description.clone())
@@ -469,7 +480,7 @@ fn build_schlib_metadata(
                     nested_string(&item.raw, &["attributes", "Manufacturer Part"]),
                 ])
             }),
-        designator: first_non_empty([nested_string(&item.raw, &["attributes", "Designator"])]),
+        designator: designator_raw,
         comment: english_metadata
             .and_then(|product| product.mpn.clone())
             .or_else(|| resolve_schlib_comment(item)),
@@ -479,6 +490,7 @@ fn build_schlib_metadata(
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(ToOwned::to_owned),
+        name_override,
     }
 }
 
