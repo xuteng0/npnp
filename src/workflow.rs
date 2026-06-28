@@ -505,6 +505,12 @@ fn push_lcsc_english_parameters(
     if let Some(datasheet_url) = product.datasheet_url.as_deref() {
         push_schlib_parameter(parameters, seen_names, "Datasheet", datasheet_url);
     }
+    push_schlib_parameter(
+        parameters,
+        seen_names,
+        "Supplier Link",
+        format!("https://www.lcsc.com/search?q={}", product.sku),
+    );
     for property in &product.properties {
         push_schlib_parameter(parameters, seen_names, &property.name, &property.value);
     }
