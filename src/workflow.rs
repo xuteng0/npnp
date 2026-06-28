@@ -427,14 +427,6 @@ fn build_schlib_metadata(
             ])
         });
 
-    if let Some(component_id) = item.lcsc_id() {
-        push_schlib_parameter(
-            &mut parameters,
-            &mut seen_names,
-            "NPNP_COMPONENT_ID",
-            component_id,
-        );
-    }
 
     if let Some(footprint_name) = resolved_footprint_name.as_deref() {
         push_schlib_parameter(
@@ -449,9 +441,6 @@ fn build_schlib_metadata(
         push_lcsc_english_parameters(&mut parameters, &mut seen_names, product);
     } else if let Some(attributes) = item.raw.get("attributes").and_then(Value::as_object) {
         for (name, value) in attributes {
-            if should_skip_schlib_parameter(name) {
-                continue;
-            }
             let Some(value) = value_to_string(value) else {
                 continue;
             };
@@ -501,7 +490,6 @@ fn push_lcsc_english_parameters(
 ) {
     push_schlib_parameter(parameters, seen_names, "Supplier", "LCSC");
     push_schlib_parameter(parameters, seen_names, "Supplier Part", product.sku.clone());
-    push_schlib_parameter(parameters, seen_names, "LCSC Part", product.sku.clone());
     if let Some(mpn) = product.mpn.as_deref() {
         push_schlib_parameter(parameters, seen_names, "Manufacturer Part", mpn);
     }
@@ -594,11 +582,14 @@ fn push_schlib_parameter(
     if normalized.is_empty() || !seen_names.insert(normalized) {
         return;
     }
+    if should_skip_schlib_parameter(&name) {
+        return;
+    }
     parameters.push(SchlibParameter { name, value });
 }
 
 fn should_skip_schlib_parameter(name: &str) -> bool {
-    const SKIP: [&str; 9] = [
+    const SKIP: [&str; 11] = [
         "Add into BOM",
         "Convert to PCB",
         "Symbol",
@@ -608,6 +599,8 @@ fn should_skip_schlib_parameter(name: &str) -> bool {
         "3D Model Title",
         "3D Model Transform",
         "Name",
+        "LCSC Part",
+        "NPNP_COMPONENT_ID",
     ];
     SKIP.iter().any(|item| item.eq_ignore_ascii_case(name))
 }
