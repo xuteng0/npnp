@@ -300,6 +300,19 @@ pub(crate) fn normalize_lcsc_id(value: &str) -> Option<String> {
     Some(format!("C{digits}"))
 }
 
+/// Read an existing `.SchLib` and return the deduplicated list of LCSC part IDs
+/// found in each component's `Supplier Part` (or equivalent) parameter.
+pub(crate) fn extract_lcsc_ids_from_schlib(path: &Path) -> Result<Vec<String>> {
+    let records = read_schlib_records(path)?;
+    let mut seen = HashSet::new();
+    let ids = records
+        .into_iter()
+        .filter_map(|record| record.identity)
+        .filter(|id| seen.insert(id.clone()))
+        .collect();
+    Ok(ids)
+}
+
 fn parse_schlib_record(name: String, data: Vec<u8>) -> Result<SchlibRecord> {
     let blocks = parse_block_stream(&data, "SchLib component data")?;
     let mut description = String::new();
