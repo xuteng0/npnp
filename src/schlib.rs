@@ -602,13 +602,15 @@ fn add_metadata_implementation(component: &mut Component, metadata: &SchlibMetad
         return;
     };
 
-    let data_file_entities = metadata
+    let Some(data_file_entity) = metadata
         .footprint_library_file
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .map(|value| vec![value.to_string()])
-        .unwrap_or_default();
+    else {
+        // If we cannot resolve a target PcbLib file, skip footprint pairing.
+        return;
+    };
 
     let mut seen_designators = HashSet::new();
     let mut map_definers = Vec::new();
@@ -630,7 +632,7 @@ fn add_metadata_implementation(component: &mut Component, metadata: &SchlibMetad
         model_type: "PCBLIB".to_string(),
         is_current: true,
         data_file_kinds: vec!["PCBLib".to_string()],
-        data_file_entities,
+        data_file_entities: vec![data_file_entity.to_string()],
         map_definers,
     });
 }
@@ -1440,18 +1442,20 @@ fn write_implementation_records(writer: &mut common::BinaryWriter, component: &C
         }
         implementation_params.push("MODELNAME", &implementation.model_name);
         implementation_params.push("MODELTYPE", &implementation.model_type);
-        implementation_params.push(
-            "DATAFILECOUNT",
-            implementation.data_file_kinds.len().to_string(),
-        );
-        for (data_file_index, kind) in implementation.data_file_kinds.iter().enumerate() {
+        let paired_count = implementation.data_file_kinds.len()
+            .min(implementation.data_file_entities.len());
+        implementation_params.push("DATAFILECOUNT", paired_count.to_string());
+        for (data_file_index, (kind, entity)) in implementation
+            .data_file_kinds
+            .iter()
+            .zip(implementation.data_file_entities.iter())
+            .enumerate()
+        {
             implementation_params.push(format!("MODELDATAFILEKIND{}", data_file_index + 1), kind);
-            if let Some(entity) = implementation.data_file_entities.get(data_file_index) {
-                implementation_params.push(
-                    format!("MODELDATAFILEENTITY{}", data_file_index + 1),
-                    entity,
-                );
-            }
+            implementation_params.push(
+                format!("MODELDATAFILEENTITY{}", data_file_index + 1),
+                entity,
+            );
         }
         implementation_params.push_bool("ISCURRENT", implementation.is_current);
         implementation_params.push(

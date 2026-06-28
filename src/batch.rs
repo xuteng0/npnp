@@ -800,29 +800,44 @@ async fn export_prepared_merged_component(
         footprint_name,
     } = prepared;
 
+    let pcblib_library = if targets.pcblib {
+        let library = build_pcblib_library_for_item(client, &item, &footprint_name).await?;
+        Some(library)
+    } else {
+        None
+    };
+
+    let footprint_link_is_valid = pcblib_library
+        .as_ref()
+        .map(|library| {
+            library
+                .components
+                .iter()
+                .any(|component| component.name.eq_ignore_ascii_case(&footprint_name))
+        })
+        .unwrap_or(false);
+
     let schlib_record = if targets.schlib {
         let english_metadata = if lcsc_english {
             Some(LcscClient::new().product_detail(&identity).await?)
         } else {
             None
         };
+        let (footprint_model_name, footprint_library_file) = if footprint_link_is_valid {
+            (Some(footprint_name.as_str()), Some(merged_pcblib_file))
+        } else {
+            (None, None)
+        };
         let component = build_schlib_component_for_item_with_metadata(
             client,
             &item,
             &component_name,
-            Some(&footprint_name),
-            Some(merged_pcblib_file),
+            footprint_model_name,
+            footprint_library_file,
             english_metadata.as_ref(),
         )
         .await?;
         Some(schlib_record_from_component(&component)?)
-    } else {
-        None
-    };
-
-    let pcblib_library = if targets.pcblib {
-        let library = build_pcblib_library_for_item(client, &item, &footprint_name).await?;
-        Some(library)
     } else {
         None
     };
