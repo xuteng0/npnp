@@ -9,8 +9,11 @@ use crate::error::{AppError, Result};
 use crate::footprint::build_pcblib_from_payload;
 use crate::lceda::{LcedaClient, SearchItem};
 use crate::lcsc::{LcscClient, LcscProduct};
-use crate::passive_naming::build_passive_component_name;
-use crate::merge::{patch_schlib_data_component_name, patch_schlib_data_with_params, schlib_record_from_component, write_pcblib_records, write_schlib_records, SCHLIB_PARAM_RENAMES};
+use crate::naming::build_passive_component_name;
+use crate::merge::{schlib_record_from_component, write_pcblib_records, write_schlib_records};
+use crate::schlib::params::{
+    patch_schlib_data_component_name, patch_schlib_data_with_params, SCHLIB_PARAM_RENAMES,
+};
 use crate::pcblib::{PcbLibrary, write_pcblib};
 use crate::schlib::{
     Component, SchlibMetadata, SchlibParameter, build_component_from_payload_with_metadata,

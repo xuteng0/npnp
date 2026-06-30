@@ -12,11 +12,13 @@ use crate::error::{AppError, Result};
 use crate::lceda::{LcedaClient, SearchItem};
 use crate::lcsc::LcscClient;
 use crate::merge::{
-    normalize_lcsc_id, patch_schlib_data_component_name, patch_schlib_data_with_params,
-    pcblib_records_from_library, read_pcblib_records, read_schlib_param, read_schlib_records,
-    read_schlib_pin_designators, schlib_record_from_component, strip_schlib_params,
-    write_pcblib_records, write_schlib_records, PcblibRecordLibrary, SchlibRecord,
-    SCHLIB_PARAM_RENAMES,
+    normalize_lcsc_id, pcblib_records_from_library, read_pcblib_records, read_schlib_records,
+    schlib_record_from_component, write_pcblib_records, write_schlib_records,
+    PcblibRecordLibrary, SchlibRecord,
+};
+use crate::schlib::params::{
+    patch_schlib_data_component_name, patch_schlib_data_with_params, read_schlib_param,
+    read_schlib_pin_designators, strip_schlib_params, SCHLIB_PARAM_RENAMES,
 };
 use crate::util::sanitize_filename;
 use crate::template::{
@@ -24,7 +26,7 @@ use crate::template::{
     load_pcblib_template_records, load_schlib_template_by_name, promote_schlib_template,
     save_pcblib_template, save_pcblib_template_by_name, save_schlib_template, ComponentClass,
 };
-use crate::passive_naming::{build_ecap_component_name, build_passive_component_name};
+use crate::naming::{build_ecap_component_name, build_passive_component_name};
 use crate::schlib::SchlibParameter;
 use crate::workflow::{
     build_link_replacements_from_lcsc_id, build_pcblib_library_for_item,

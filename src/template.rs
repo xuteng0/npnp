@@ -2,9 +2,10 @@ use std::path::{Path, PathBuf};
 
 use crate::error::{AppError, Result};
 use crate::merge::{
-    PcblibRecordLibrary, SchlibRecord, patch_schlib_data_component_name, read_pcblib_records,
-    read_schlib_records, strip_schlib_params, write_pcblib_records, write_schlib_records,
+    PcblibRecordLibrary, SchlibRecord, read_pcblib_records, read_schlib_records,
+    write_pcblib_records, write_schlib_records,
 };
+use crate::schlib::params::{patch_schlib_data_component_name, strip_schlib_params};
 use crate::pcblib::{
     CoordPoint, PcbComponent, PcbComponentBody, PcbLibrary, PcbModel, PcbPad, PcbTrack,
     LAYER_MECHANICAL_1, LAYER_TOP, LAYER_TOP_OVERLAY, PAD_HOLE_ROUND, PAD_SHAPE_RECTANGULAR,

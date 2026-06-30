@@ -7,7 +7,7 @@ pub mod lceda;
 pub mod lcsc;
 pub mod merge;
 pub mod pcblib;
-mod passive_naming;
+mod naming;
 pub mod schlib;
 pub mod template;
 pub mod util;

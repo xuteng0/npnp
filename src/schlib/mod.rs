@@ -1,6 +1,6 @@
-#[path = "schlib_common.rs"]
 #[allow(dead_code)]
 mod common;
+pub mod params;
 
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
@@ -10,6 +10,7 @@ use std::path::Path;
 use serde_json::Value;
 
 use crate::error::Result;
+use crate::schlib::params::is_default_visible_parameter;
 use crate::util::nested_string;
 
 const WHITE_BGR: i32 = 0xFFFFFF;
@@ -1586,49 +1587,6 @@ fn angle_delta_ccw(start: f64, end: f64) -> f64 {
         delta += 360.0;
     }
     delta
-}
-fn designator_prefix(designator: &str) -> String {
-    // EasyEDA stores designators as e.g. "C?", "R1" — strip trailing digits and '?'
-    designator
-        .trim()
-        .trim_end_matches(|c: char| c == '?' || c.is_ascii_digit())
-        .trim()
-        .to_ascii_uppercase()
-}
-pub(crate) fn is_default_visible_parameter(designator: &str, param_name: &str) -> bool {
-    let d = designator_prefix(designator);
-    let n = param_name.trim().to_ascii_lowercase();
-    match d.as_str() {
-        "R" | "RV" | "VR" => {
-            n.contains("resistance")
-                || n.contains("tolerance")
-                || n.contains("power")
-                || n.contains("package")
-                || n.contains("case")
-        }
-        "C" | "CE" | "CV" => {
-            n.contains("capacitance")
-                || n.contains("tolerance")
-                || n.contains("voltage")
-                || n.contains("temperature")
-                || n.contains("package")
-                || n.contains("case")
-        }
-        "L" | "FB" => {
-            n.contains("inductance")
-                || n.contains("tolerance")
-                || n.contains("current")
-                || n.contains("package")
-                || n.contains("case")
-        }
-        "X" | "Y" | "XTAL" => {
-            n.contains("frequency")
-                || n.contains("package")
-                || n.contains("case")
-                || n.contains("tolerance")
-        }
-        _ => false,
-    }
 }
 fn stable_unique_id(name: &str, salt: &str) -> String {
     common::stable_unique_id(name, salt)
