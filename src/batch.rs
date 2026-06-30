@@ -28,12 +28,12 @@ use crate::template::{
 };
 use crate::naming::{build_ecap_component_name, build_passive_component_name};
 use crate::schlib::SchlibParameter;
-use crate::workflow::{
+use crate::component::{
     build_link_replacements_from_lcsc_id, build_pcblib_library_for_item,
     build_schlib_component_for_item_with_metadata, build_schlib_replacements_from_lcsc,
-    detect_template_footprint, export_pcblib_with_options,
-    export_schlib_with_options, footprint_name_from_item, resolved_footprint_name,
+    detect_template_footprint, footprint_name_from_item, resolved_footprint_name,
 };
+use crate::workflow::{export_pcblib_with_options, export_schlib_with_options};
 
 #[derive(Debug, Clone)]
 pub struct BatchOptions {
@@ -951,7 +951,7 @@ async fn export_prepared_merged_component(
                     step_bytes
                 } else if let Some(fp_uuid) = item.footprint_uuid() {
                     if let Ok(fp_data) = client.component_detail(&fp_uuid).await {
-                        crate::workflow::load_step_bytes_for_pcblib_pub(client, &item, &fp_data)
+                        crate::component::load_step_bytes_for_pcblib(client, &item, &fp_data)
                             .await
                     } else {
                         None

@@ -1,5 +1,6 @@
 pub mod app;
 pub mod batch;
+pub mod component;
 pub mod cli;
 pub mod error;
 pub mod footprint;
