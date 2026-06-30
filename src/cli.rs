@@ -66,6 +66,9 @@ pub enum Commands {
         /// Use English product metadata from lcsc.com for SchLib parameters/description
         #[arg(long)]
         lcsc_english: bool,
+        /// For chip R/C: use standardised IPC footprint and schematic template from assets/
+        #[arg(long)]
+        use_template: bool,
         #[arg(long)]
         force: bool,
     },
@@ -77,6 +80,9 @@ pub enum Commands {
         index: usize,
         #[arg(long, default_value = "pcblib")]
         output: PathBuf,
+        /// For chip R/C: use standardised IPC footprint from assets/
+        #[arg(long)]
+        use_template: bool,
         #[arg(long)]
         force: bool,
     },
@@ -115,6 +121,9 @@ pub enum Commands {
         /// Use English product metadata from lcsc.com for SchLib parameters/description
         #[arg(long)]
         lcsc_english: bool,
+        /// For chip R/C: use standardised IPC footprints and schematic templates from assets/
+        #[arg(long)]
+        use_template: bool,
         #[arg(long)]
         force: bool,
     },
@@ -137,6 +146,9 @@ pub enum Commands {
         /// Use English product metadata from lcsc.com for SchLib parameters/description
         #[arg(long)]
         lcsc_english: bool,
+        /// For chip R/C: use standardised IPC footprints and schematic templates from assets/
+        #[arg(long)]
+        use_template: bool,
     },
 }
 

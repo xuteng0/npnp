@@ -466,6 +466,237 @@ fn build_name_from_tokens(
     Some(parts.join("_"))
 }
 
+fn detect_ecap_prefix(category: &str) -> &'static str {
+    let cat = category.to_ascii_uppercase();
+    if cat.contains("POLYMER") {
+        "PCAP"
+    } else if cat.contains("TANTALUM") {
+        "TANT"
+    } else if cat.contains("FILM") {
+        "FCAP"
+    } else {
+        "ECAP"
+    }
+}
+
+fn detect_ecap_mounting(category: &str, params: &[SchlibParameter]) -> Option<&'static str> {
+    if let Some(mounting) = find_param(params, &["mounting"]) {
+        let lower = mounting.to_ascii_lowercase();
+        if lower.contains("smd") || lower.contains("surface") {
+            return Some("SMD");
+        }
+        if lower.contains("through")
+            || lower.contains("radial")
+            || lower.contains("leaded")
+            || lower.contains("plug")
+        {
+            return Some("RAD");
+        }
+        if lower.contains("axial") {
+            return Some("AXIAL");
+        }
+        if lower.contains("snap") {
+            return Some("SNAPIN");
+        }
+    }
+    let cat = category.to_ascii_uppercase();
+    if cat.contains("SMD") || cat.contains("SURFACE") {
+        Some("SMD")
+    } else if cat.contains("LEADED") || cat.contains("THROUGH") || cat.contains("RADIAL") {
+        Some("RAD")
+    } else {
+        None
+    }
+}
+
+fn extract_dim_numbers(s: &str) -> Vec<f64> {
+    let mut result = Vec::new();
+    let mut current = String::new();
+    for ch in s.chars() {
+        if ch.is_ascii_digit() || (ch == '.' && !current.contains('.') && !current.is_empty()) {
+            current.push(ch);
+        } else if !current.is_empty() {
+            if let Ok(n) = current.parse::<f64>() {
+                if n > 0.0 {
+                    result.push(n);
+                }
+            }
+            current.clear();
+        }
+    }
+    if !current.is_empty() {
+        if let Ok(n) = current.parse::<f64>() {
+            if n > 0.0 {
+                result.push(n);
+            }
+        }
+    }
+    result
+}
+
+fn format_dim(value: f64) -> String {
+    format!("{:.1}", value)
+}
+
+fn parse_ecap_smd_size(params: &[SchlibParameter]) -> Option<String> {
+    let pkg = find_param(params, &["package", "case", "size"])?;
+    let nums = extract_dim_numbers(pkg);
+    if nums.len() >= 2 {
+        Some(format!("D{}H{}", format_dim(nums[0]), format_dim(nums[1])))
+    } else {
+        None
+    }
+}
+
+fn standard_rad_cap_pitch(diam_mm: f64) -> Option<f64> {
+    // IEC 60384 / industry-standard lead pitch by body diameter
+    if diam_mm < 5.5 {
+        Some(2.0)
+    } else if diam_mm < 7.5 {
+        Some(2.5)
+    } else if diam_mm < 9.5 {
+        Some(3.5)
+    } else if diam_mm < 14.0 {
+        Some(5.0)
+    } else if diam_mm < 19.0 {
+        Some(7.5)
+    } else {
+        None
+    }
+}
+
+fn parse_ecap_rad_size(params: &[SchlibParameter]) -> Option<String> {
+    let pkg = find_param(params, &["package", "case", "size"])?;
+    let nums = extract_dim_numbers(pkg);
+    let diam = nums.first().copied()?;
+    let pitch = find_param(params, &["lead spacing", "pin spacing", "pitch"])
+        .and_then(|v| extract_dim_numbers(v).into_iter().next())
+        .or_else(|| standard_rad_cap_pitch(diam));
+    if let Some(p) = pitch {
+        Some(format!("D{}_P{}", format_dim(diam), format_dim(p)))
+    } else {
+        Some(format!("D{}", format_dim(diam)))
+    }
+}
+
+fn parse_tant_case(params: &[SchlibParameter]) -> Option<String> {
+    let pkg = find_param(params, &["package", "case"])?;
+    let upper = pkg.to_ascii_uppercase();
+    if let Some(idx) = upper.find("CASE") {
+        let rest =
+            upper[idx + 4..].trim_start_matches(|c: char| c == '_' || c == ' ' || c == '-');
+        if let Some(letter) = rest.chars().next() {
+            if letter.is_ascii_uppercase() {
+                return Some(format!("CASE{letter}"));
+            }
+        }
+    }
+    for (code, case) in [
+        ("3216", "CASEA"),
+        ("1206", "CASEA"),
+        ("3528", "CASEB"),
+        ("6032", "CASEC"),
+        ("7343", "CASED"),
+        ("7360", "CASEE"),
+    ] {
+        if upper.contains(code) {
+            return Some(case.to_string());
+        }
+    }
+    None
+}
+
+fn detect_ecap_optional_features(params: &[SchlibParameter]) -> Vec<String> {
+    let mut features: Vec<String> = Vec::new();
+    let mut has_125c = false;
+    for param in params {
+        let combined = format!("{} {}", param.name, param.value).to_ascii_uppercase();
+        if (combined.contains("LOW") && combined.contains("ESR")) || combined.contains("LOWESR") {
+            if !features.contains(&"LOWESR".to_string()) {
+                features.push("LOWESR".to_string());
+            }
+        }
+        if (combined.contains("HIGH") && combined.contains("RIPPLE"))
+            || combined.contains("HIGHRIPPLE")
+        {
+            if !features.contains(&"HIGHRIPPLE".to_string()) {
+                features.push("HIGHRIPPLE".to_string());
+            }
+        }
+        if (combined.contains("LONG") && combined.contains("LIFE"))
+            || combined.contains("LONGLIFE")
+        {
+            if !features.contains(&"LONGLIFE".to_string()) {
+                features.push("LONGLIFE".to_string());
+            }
+        }
+        if combined.contains("125") && combined.contains("C") {
+            if !features.contains(&"125C".to_string()) {
+                features.push("125C".to_string());
+                has_125c = true;
+            }
+        } else if combined.contains("105") && combined.contains("C") && !has_125c {
+            if !features.contains(&"105C".to_string()) {
+                features.push("105C".to_string());
+            }
+        }
+        if combined.contains("AEC") || combined.contains("AUTOMOTIVE") {
+            if !features.contains(&"AECQ200".to_string()) {
+                features.push("AECQ200".to_string());
+            }
+        }
+        if combined.contains("AUDIO") {
+            if !features.contains(&"AUDIO".to_string()) {
+                features.push("AUDIO".to_string());
+            }
+        }
+    }
+    features
+}
+
+/// Build a component name for polarized capacitors following the ECAP convention:
+/// `ECAP_<VALUE>_<VOLTAGE>_[FEATURES_]<MOUNT>_<SIZE>_<LCSC>`
+pub(crate) fn build_ecap_component_name(
+    category: &str,
+    params: &[SchlibParameter],
+    lcsc_id: Option<&str>,
+) -> Option<String> {
+    let lcsc = normalize_lcsc_token(lcsc_id)?;
+    let prefix = detect_ecap_prefix(category);
+    let capacitance = find_param(params, &["capacitance"]).and_then(normalize_capacitance)?;
+    let voltage = find_param(params, &["voltage"]).and_then(normalize_voltage)?;
+    let features = detect_ecap_optional_features(params);
+
+    let name = if prefix == "TANT" {
+        let case = parse_tant_case(params);
+        let mut parts = vec![prefix.to_string(), capacitance, voltage];
+        parts.extend(features);
+        if let Some(c) = case {
+            parts.push(c);
+        }
+        parts.push(lcsc);
+        parts.join("_")
+    } else {
+        let mounting = detect_ecap_mounting(category, params).unwrap_or("RAD");
+        let size = match mounting {
+            "SMD" => parse_ecap_smd_size(params),
+            _ => parse_ecap_rad_size(params),
+        };
+        let mut parts = vec![prefix.to_string(), capacitance, voltage];
+        parts.extend(features);
+        parts.push(mounting.to_string());
+        if let Some(s) = size {
+            parts.push(s);
+        }
+        parts.push(lcsc);
+        parts.join("_")
+    };
+
+    name.chars()
+        .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_' || c == '.')
+        .then_some(name)
+}
+
 pub(crate) fn build_passive_component_name(
     designator: &str,
     parameters: &[SchlibParameter],
@@ -590,6 +821,94 @@ mod tests {
         assert_eq!(
             build_passive_component_name("L?", &params, Some("C3716403")).as_deref(),
             Some("FB_600R_100MHZ_0603_300MA_C3716403")
+        );
+    }
+
+    #[test]
+    fn builds_ecap_radial_name_with_explicit_pitch() {
+        let params = vec![
+            test_param("Capacitance", "100\u{00B5}F"),
+            test_param("Voltage", "50V"),
+            test_param("Package / Case", "\u{03A6}8\u{00D7}10mm"),
+            test_param("Lead Spacing", "3.5mm"),
+        ];
+        assert_eq!(
+            build_ecap_component_name(
+                "Aluminum Electrolytic Capacitors - Leaded",
+                &params,
+                Some("C970687")
+            )
+            .as_deref(),
+            Some("ECAP_100U_50V_RAD_D8.0_P3.5_C970687")
+        );
+    }
+
+    #[test]
+    fn builds_ecap_radial_name_uses_standard_pitch_fallback() {
+        // LCSC often returns "SMD,D8xL10.2mm" without a Lead Spacing property.
+        // Standard pitch for 8mm body = 3.5mm.
+        let params = vec![
+            test_param("Capacitance", "100uF"),
+            test_param("Voltage Rating", "50V"),
+            test_param("Package", "SMD,D8xL10.2mm"),
+        ];
+        assert_eq!(
+            build_ecap_component_name(
+                "Capacitors/Aluminum Electrolytic Capacitors",
+                &params,
+                Some("C970687")
+            )
+            .as_deref(),
+            Some("ECAP_100U_50V_RAD_D8.0_P3.5_C970687")
+        );
+    }
+
+    #[test]
+    fn builds_ecap_smd_name() {
+        let params = vec![
+            test_param("Capacitance", "100\u{00B5}F"),
+            test_param("Voltage", "25V"),
+            test_param("Package / Case", "\u{03A6}6.3\u{00D7}5.4mm"),
+        ];
+        assert_eq!(
+            build_ecap_component_name(
+                "Aluminum Electrolytic Capacitors - SMD",
+                &params,
+                Some("C12345")
+            )
+            .as_deref(),
+            Some("ECAP_100U_25V_SMD_D6.3H5.4_C12345")
+        );
+    }
+
+    #[test]
+    fn builds_tant_name_from_case_code() {
+        let params = vec![
+            test_param("Capacitance", "47\u{00B5}F"),
+            test_param("Voltage", "10V"),
+            test_param("Package / Case", "3528-21"),
+        ];
+        assert_eq!(
+            build_ecap_component_name("Tantalum Capacitors", &params, Some("C99999")).as_deref(),
+            Some("TANT_47U_10V_CASEB_C99999")
+        );
+    }
+
+    #[test]
+    fn builds_ecap_name_with_decimal_voltage() {
+        let params = vec![
+            test_param("Capacitance", "100\u{00B5}F"),
+            test_param("Voltage", "6.3V"),
+            test_param("Package / Case", "\u{03A6}5\u{00D7}5.4mm"),
+        ];
+        assert_eq!(
+            build_ecap_component_name(
+                "Aluminum Electrolytic Capacitors - SMD",
+                &params,
+                Some("C11111")
+            )
+            .as_deref(),
+            Some("ECAP_100U_6V3_SMD_D5.0H5.4_C11111")
         );
     }
 

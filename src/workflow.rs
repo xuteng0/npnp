@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -10,10 +10,16 @@ use crate::footprint::build_pcblib_from_payload;
 use crate::lceda::{LcedaClient, SearchItem};
 use crate::lcsc::{LcscClient, LcscProduct};
 use crate::passive_naming::build_passive_component_name;
+use crate::merge::{patch_schlib_data_component_name, patch_schlib_data_with_params, schlib_record_from_component, write_pcblib_records, write_schlib_records, SCHLIB_PARAM_RENAMES};
 use crate::pcblib::{PcbLibrary, write_pcblib};
 use crate::schlib::{
     Component, SchlibMetadata, SchlibParameter, build_component_from_payload_with_metadata,
     write_schlib,
+};
+use crate::template::{
+    build_ipc_pcblib, classify_component, extract_package_size, find_assets_dir,
+    load_local_step, load_pcblib_template_records, load_schlib_template_record,
+    standard_footprint_name, ComponentClass,
 };
 use crate::util::{nested_string, sanitize_filename, split_obj_and_mtl, value_to_string};
 
@@ -124,6 +130,22 @@ fn resolved_symbol_component_name(item: &SearchItem, payload: &Value) -> String 
     .unwrap_or_else(|| "component".to_string())
 }
 
+/// Detect template footprint context for a component: returns `(class, package, std_name)`.
+pub(crate) fn detect_template_footprint(
+    item: &SearchItem,
+    footprint_name: &str,
+) -> Option<(ComponentClass, String, String)> {
+    let designator =
+        nested_string(&item.raw, &["attributes", "Designator"]).unwrap_or_default();
+    let class = classify_component(&designator);
+    if class == ComponentClass::Other {
+        return None;
+    }
+    let package = extract_package_size(footprint_name)?;
+    let std_name = standard_footprint_name(class, &package);
+    Some((class, package, std_name))
+}
+
 pub(crate) fn resolved_footprint_name(item: &SearchItem, payload: &Value) -> String {
     first_non_empty([
         nested_string(payload, &["result", "display_title"]),
@@ -136,6 +158,68 @@ pub(crate) fn resolved_footprint_name(item: &SearchItem, payload: &Value) -> Str
         (!item.display_name().trim().is_empty()).then(|| item.display_name().to_string()),
     ])
     .unwrap_or_else(|| "footprint".to_string())
+}
+
+/// Extract a footprint name from item attributes without fetching footprint detail.
+/// Falls back to item display name if no footprint attributes are present.
+pub(crate) fn footprint_name_from_item(item: &SearchItem) -> String {
+    resolved_footprint_name(item, &serde_json::Value::Null)
+}
+
+/// Build a parameter replacement map from LCSC English metadata for patching a template record.
+/// Minimal replacements map containing only the LCSC-derived link parameters.
+/// Used when full LCSC English metadata is unavailable but links should still
+/// always be present regardless of what slots the template provides.
+pub(crate) fn build_link_replacements_from_lcsc_id(lcsc_id: &str) -> HashMap<String, String> {
+    let mut map = HashMap::new();
+    let supplier_link = format!("https://www.lcsc.com/search?q={lcsc_id}");
+    map.insert("Supplier Link".to_string(), supplier_link.clone());
+    map.insert("ComponentLink2URL".to_string(), supplier_link);
+    map.insert("ComponentLink2Description".to_string(), "Supplier Link".to_string());
+    map
+}
+
+pub(crate) fn build_schlib_replacements_from_lcsc(
+    product: &LcscProduct,
+    footprint_name: &str,
+) -> HashMap<String, String> {
+    let mut map = HashMap::new();
+    if !footprint_name.is_empty() {
+        map.insert("Footprint".to_string(), footprint_name.to_string());
+    }
+    map.insert("Supplier".to_string(), "LCSC".to_string());
+    map.insert("Supplier Part Number".to_string(), product.sku.clone());
+    if let Some(mpn) = &product.mpn {
+        map.insert("MPN".to_string(), mpn.clone());
+    }
+    if let Some(mfr) = &product.manufacturer {
+        map.insert("Manufacturer".to_string(), mfr.clone());
+    }
+    if let Some(desc) = &product.description {
+        map.insert("LCSC Part Name".to_string(), desc.clone());
+    }
+    if let Some(cat) = product.effective_category() {
+        map.insert("Category".to_string(), cat.to_string());
+    }
+    if let Some(ds) = &product.datasheet_url {
+        map.insert("Datasheet".to_string(), ds.clone());
+        map.insert("ComponentLink1URL".to_string(), ds.clone());
+    }
+    let supplier_link = format!("https://www.lcsc.com/search?q={}", product.sku);
+    map.insert("Supplier Link".to_string(), supplier_link.clone());
+    map.insert("ComponentLink2URL".to_string(), supplier_link);
+    for prop in &product.properties {
+        map.insert(prop.name.clone(), prop.value.clone());
+    }
+    map
+}
+
+pub(crate) async fn load_step_bytes_for_pcblib_pub(
+    client: &LcedaClient,
+    item: &SearchItem,
+    footprint_data: &Value,
+) -> Option<Vec<u8>> {
+    load_step_bytes_for_pcblib(client, item, footprint_data).await
 }
 
 async fn load_step_bytes_for_pcblib(
@@ -270,19 +354,71 @@ pub async fn export_pcblib(
     out_dir: &Path,
     force: bool,
 ) -> Result<PathBuf> {
+    export_pcblib_with_options(client, item, out_dir, force, false).await
+}
+
+pub async fn export_pcblib_with_options(
+    client: &LcedaClient,
+    item: &SearchItem,
+    out_dir: &Path,
+    force: bool,
+    use_template: bool,
+) -> Result<PathBuf> {
     fs::create_dir_all(out_dir)?;
     let footprint_uuid = item
         .footprint_uuid()
         .ok_or(AppError::MissingSymbolOrFootprint)?;
     let footprint_data = client.component_detail(&footprint_uuid).await?;
-    let footprint_name = resolved_footprint_name(item, &footprint_data);
-    let out_file = out_dir.join(format!("{}.PcbLib", sanitize_filename(&footprint_name)));
-    if out_file.exists() && !force {
+    let easyeda_footprint_name = resolved_footprint_name(item, &footprint_data);
+
+    // Detect template context: classify component and extract package size.
+    let template_ctx = if use_template {
+        let designator =
+            nested_string(&item.raw, &["attributes", "Designator"]).unwrap_or_default();
+        let class = classify_component(&designator);
+        if class != ComponentClass::Other {
+            extract_package_size(&easyeda_footprint_name).map(|pkg| (class, pkg))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    if let Some((class, package)) = template_ctx {
+        let std_name = standard_footprint_name(class, &package);
+        let out_file = out_dir.join(format!("{}.PcbLib", sanitize_filename(&std_name)));
+        if out_file.exists() && !force {
+            return Ok(out_file);
+        }
+        // Prefer the actual template file from assets/ (e.g. assets/R0402.PcbLib).
+        if let Some(assets_dir) = find_assets_dir() {
+            if let Some(records) = load_pcblib_template_records(&assets_dir, class, &package) {
+                write_pcblib_records(&records, &out_file)?;
+                return Ok(out_file);
+            }
+        }
+        // Fall back to a programmatically generated IPC-7351 footprint.
+        let step_bytes = find_assets_dir()
+            .and_then(|dir| load_local_step(&dir, class, &package));
+        let step_bytes = if step_bytes.is_some() {
+            step_bytes
+        } else {
+            load_step_bytes_for_pcblib(client, item, &footprint_data).await
+        };
+        let library = build_ipc_pcblib(class, &package, &std_name, step_bytes)?;
+        write_pcblib(&library, &out_file)?;
         return Ok(out_file);
     }
 
     let library =
-        build_pcblib_library_from_detail(client, item, &footprint_data, &footprint_name).await?;
+        build_pcblib_library_from_detail(client, item, &footprint_data, &easyeda_footprint_name)
+            .await?;
+    let out_file =
+        out_dir.join(format!("{}.PcbLib", sanitize_filename(&easyeda_footprint_name)));
+    if out_file.exists() && !force {
+        return Ok(out_file);
+    }
     write_pcblib(&library, &out_file)?;
     Ok(out_file)
 }
@@ -293,7 +429,7 @@ pub async fn export_schlib(
     out_dir: &Path,
     force: bool,
 ) -> Result<PathBuf> {
-    export_schlib_with_options(client, item, out_dir, force, false).await
+    export_schlib_with_options(client, item, out_dir, force, false, false).await
 }
 
 pub async fn export_schlib_with_options(
@@ -302,6 +438,7 @@ pub async fn export_schlib_with_options(
     out_dir: &Path,
     force: bool,
     lcsc_english: bool,
+    use_template: bool,
 ) -> Result<PathBuf> {
     fs::create_dir_all(out_dir)?;
     let symbol_uuid = item
@@ -309,17 +446,40 @@ pub async fn export_schlib_with_options(
         .ok_or(AppError::MissingSymbolOrFootprint)?;
     let symbol_data = client.component_detail(&symbol_uuid).await?;
     let component_name = resolved_symbol_component_name(item, &symbol_data);
+
+    // Resolve footprint link, potentially overriding with the standard IPC name.
     let (footprint_model_name, footprint_library_file) =
         if let Some(footprint_uuid) = item.footprint_uuid() {
             let footprint_data = client.component_detail(&footprint_uuid).await?;
-            let footprint_name = resolved_footprint_name(item, &footprint_data);
-            (
-                Some(footprint_name.clone()),
-                Some(format!("{}.PcbLib", sanitize_filename(&footprint_name))),
-            )
+            let easyeda_footprint_name = resolved_footprint_name(item, &footprint_data);
+
+            let (model_name, lib_file) = if use_template {
+                let designator = nested_string(&item.raw, &["attributes", "Designator"])
+                    .unwrap_or_default();
+                let class = classify_component(&designator);
+                if class != ComponentClass::Other {
+                    if let Some(pkg) = extract_package_size(&easyeda_footprint_name) {
+                        let std_name = standard_footprint_name(class, &pkg);
+                        let lib = format!("{}.PcbLib", std_name);
+                        (std_name, lib)
+                    } else {
+                        let lib = format!("{}.PcbLib", sanitize_filename(&easyeda_footprint_name));
+                        (easyeda_footprint_name, lib)
+                    }
+                } else {
+                    let lib = format!("{}.PcbLib", sanitize_filename(&easyeda_footprint_name));
+                    (easyeda_footprint_name, lib)
+                }
+            } else {
+                let lib = format!("{}.PcbLib", sanitize_filename(&easyeda_footprint_name));
+                (easyeda_footprint_name, lib)
+            };
+
+            (Some(model_name), Some(lib_file))
         } else {
             (None, None)
         };
+
     let english_metadata = if lcsc_english {
         let lcsc_id = item
             .lcsc_id()
@@ -337,11 +497,64 @@ pub async fn export_schlib_with_options(
         footprint_library_file.as_deref(),
         english_metadata.as_ref(),
     )?;
+
     let out_file = out_dir.join(format!("{}.SchLib", sanitize_filename(component.name())));
     if out_file.exists() && !force {
         return Ok(out_file);
     }
-    write_schlib(&component, &out_file)?;
+
+    // If a SchLib template exists in assets/, substitute its geometry while keeping metadata.
+    // Skip for polarized capacitors (electrolytic, tantalum, etc.) — template is MLCC-only.
+    let template_record = if use_template {
+        let designator = nested_string(&item.raw, &["attributes", "Designator"])
+            .unwrap_or_default();
+        let class = classify_component(&designator);
+        let polarized = class == ComponentClass::ChipCapacitor
+            && english_metadata
+                .as_ref()
+                .is_some_and(|p| p.is_polarized_capacitor());
+        if class != ComponentClass::Other && !polarized {
+            find_assets_dir().and_then(|dir| load_schlib_template_record(&dir, class))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    if let Some(mut tmpl) = template_record {
+        let template_designator = tmpl.name.clone();
+        let base = schlib_record_from_component(&component)?;
+        if let Some(product) = &english_metadata {
+            let fp_name = footprint_model_name.as_deref().unwrap_or("");
+            let replacements = build_schlib_replacements_from_lcsc(product, fp_name);
+            let description = product.description.clone().unwrap_or_default();
+            let footprint_link = footprint_model_name.as_deref().zip(footprint_library_file.as_deref());
+            tmpl.data = patch_schlib_data_with_params(
+                &tmpl.data,
+                &base.name,
+                Some(&description),
+                &replacements,
+                footprint_link,
+                &["1", "2"],
+                SCHLIB_PARAM_RENAMES,
+                &template_designator,
+            );
+        } else {
+            tmpl.data = patch_schlib_data_component_name(
+                &tmpl.data,
+                &base.name,
+                base.identity.as_deref(),
+            );
+        }
+        tmpl.name = base.name;
+        tmpl.description = base.description;
+        tmpl.identity = base.identity;
+        tmpl.weight = base.weight.max(tmpl.weight);
+        write_schlib_records(&[tmpl], &out_file)?;
+    } else {
+        write_schlib(&component, &out_file)?;
+    }
     Ok(out_file)
 }
 
@@ -489,9 +702,9 @@ fn push_lcsc_english_parameters(
     product: &LcscProduct,
 ) {
     push_schlib_parameter(parameters, seen_names, "Supplier", "LCSC");
-    push_schlib_parameter(parameters, seen_names, "Supplier Part", product.sku.clone());
+    push_schlib_parameter(parameters, seen_names, "Supplier Part Number", product.sku.clone());
     if let Some(mpn) = product.mpn.as_deref() {
-        push_schlib_parameter(parameters, seen_names, "Manufacturer Part", mpn);
+        push_schlib_parameter(parameters, seen_names, "MPN", mpn);
     }
     if let Some(manufacturer) = product.manufacturer.as_deref() {
         push_schlib_parameter(parameters, seen_names, "Manufacturer", manufacturer);
@@ -499,18 +712,18 @@ fn push_lcsc_english_parameters(
     if let Some(description) = product.description.as_deref() {
         push_schlib_parameter(parameters, seen_names, "LCSC Part Name", description);
     }
-    if let Some(category) = product.category.as_deref() {
+    if let Some(category) = product.effective_category() {
         push_schlib_parameter(parameters, seen_names, "Category", category);
     }
     if let Some(datasheet_url) = product.datasheet_url.as_deref() {
         push_schlib_parameter(parameters, seen_names, "Datasheet", datasheet_url);
+        push_schlib_parameter(parameters, seen_names, "ComponentLink1Description", "Datasheet");
+        push_schlib_parameter(parameters, seen_names, "ComponentLink1URL", datasheet_url);
     }
-    push_schlib_parameter(
-        parameters,
-        seen_names,
-        "Supplier Link",
-        format!("https://www.lcsc.com/search?q={}", product.sku),
-    );
+    let supplier_link = format!("https://www.lcsc.com/search?q={}", product.sku);
+    push_schlib_parameter(parameters, seen_names, "Supplier Link", supplier_link.clone());
+    push_schlib_parameter(parameters, seen_names, "ComponentLink2Description", "Supplier Link");
+    push_schlib_parameter(parameters, seen_names, "ComponentLink2URL", supplier_link);
     for property in &product.properties {
         push_schlib_parameter(parameters, seen_names, &property.name, &property.value);
     }

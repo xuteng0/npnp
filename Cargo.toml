@@ -31,6 +31,11 @@ path = "src/lib.rs"
 name = "npnp"
 path = "src/main.rs"
 
+[[bin]]
+name = "dump_stream"
+path = "src/bin/dump_stream.rs"
+
+
 [dependencies]
 encoding_rs = "0.8.35"
 cfb = "0.14.0"

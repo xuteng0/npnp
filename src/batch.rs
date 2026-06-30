@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -12,15 +12,25 @@ use crate::error::{AppError, Result};
 use crate::lceda::{LcedaClient, SearchItem};
 use crate::lcsc::LcscClient;
 use crate::merge::{
-    normalize_lcsc_id, pcblib_records_from_library, read_pcblib_records, read_schlib_records,
-    schlib_record_from_component, write_pcblib_records, write_schlib_records, PcblibRecordLibrary,
-    SchlibRecord,
+    normalize_lcsc_id, patch_schlib_data_component_name, patch_schlib_data_with_params,
+    pcblib_records_from_library, read_pcblib_records, read_schlib_param, read_schlib_records,
+    read_schlib_pin_designators, schlib_record_from_component, strip_schlib_params,
+    write_pcblib_records, write_schlib_records, PcblibRecordLibrary, SchlibRecord,
+    SCHLIB_PARAM_RENAMES,
 };
-use crate::pcblib::{write_pcblib, PcbLibrary};
 use crate::util::sanitize_filename;
+use crate::template::{
+    build_ipc_pcblib, find_assets_dir, load_local_step, load_pcblib_template_by_name,
+    load_pcblib_template_records, load_schlib_template_by_name, promote_schlib_template,
+    save_pcblib_template, save_pcblib_template_by_name, save_schlib_template, ComponentClass,
+};
+use crate::passive_naming::{build_ecap_component_name, build_passive_component_name};
+use crate::schlib::SchlibParameter;
 use crate::workflow::{
-    build_pcblib_library_for_item, build_schlib_component_for_item_with_metadata, export_pcblib,
-    export_schlib_with_options, resolved_footprint_name,
+    build_link_replacements_from_lcsc_id, build_pcblib_library_for_item,
+    build_schlib_component_for_item_with_metadata, build_schlib_replacements_from_lcsc,
+    detect_template_footprint, export_pcblib_with_options,
+    export_schlib_with_options, footprint_name_from_item, resolved_footprint_name,
 };
 
 #[derive(Debug, Clone)]
@@ -36,6 +46,7 @@ pub struct BatchOptions {
     pub parallel: usize,
     pub continue_on_error: bool,
     pub lcsc_english: bool,
+    pub use_template: bool,
     pub force: bool,
 }
 
@@ -189,7 +200,7 @@ struct MergeArtifacts {
     identity: String,
     component_name: String,
     schlib_record: Option<SchlibRecord>,
-    pcblib_library: Option<PcbLibrary>,
+    pcblib_library: Option<PcblibRecordLibrary>,
 }
 
 #[derive(Debug, Clone)]
@@ -199,6 +210,8 @@ struct PreparedMergedComponent {
     item: SearchItem,
     component_name: String,
     footprint_name: String,
+    /// Set when use_template detected a chip R/C with a known IPC package.
+    template_ctx: Option<(ComponentClass, String)>,
 }
 
 #[derive(Debug)]
@@ -402,9 +415,9 @@ async fn export_batch_merged_fresh(
     progress.note(format!("Library: {library_name}"));
 
     let mut used_symbol_names = HashSet::new();
-    let mut used_footprint_names = HashSet::new();
     let mut schlib_records = Vec::new();
-    let mut pcblib_library = PcbLibrary::default();
+    let mut pcblib_library = PcblibRecordLibrary::default();
+    let mut pcblib_seen_names: HashSet<String> = HashSet::new();
     let mut first_error = None;
     let mut prepared_components = Vec::with_capacity(ids.len());
 
@@ -413,7 +426,7 @@ async fn export_batch_merged_fresh(
             client,
             &id,
             &mut used_symbol_names,
-            &mut used_footprint_names,
+            options.use_template,
         )
         .await
         {
@@ -438,9 +451,12 @@ async fn export_batch_merged_fresh(
         1
     };
 
+    let no_donors: Arc<HashMap<String, SchlibRecord>> = Arc::new(HashMap::new());
+
     if actual_parallel > 1 {
         let semaphore = Arc::new(Semaphore::new(actual_parallel));
         let mut join_set: JoinSet<(usize, String, Result<MergeArtifacts>)> = JoinSet::new();
+        let known_footprint_snapshot = Arc::new(pcblib_seen_names.clone());
 
         for (idx, prepared) in prepared_components.into_iter().enumerate() {
             let client = client.clone();
@@ -448,6 +464,9 @@ async fn export_batch_merged_fresh(
             let semaphore = semaphore.clone();
             let lcsc_english = options.lcsc_english;
             let source_id = prepared.source_id.clone();
+            let known = Arc::clone(&known_footprint_snapshot);
+            let donors = Arc::clone(&no_donors);
+            let tdir = options.output.clone();
             join_set.spawn(async move {
                 let _permit = semaphore
                     .acquire_owned()
@@ -459,6 +478,9 @@ async fn export_batch_merged_fresh(
                     prepared,
                     &merged_pcblib_file,
                     lcsc_english,
+                    &known,
+                    &donors,
+                    &tdir,
                 )
                 .await;
                 (idx, source_id, result)
@@ -495,7 +517,11 @@ async fn export_batch_merged_fresh(
                         schlib_records.push(record);
                     }
                     if let Some(library) = artifacts.pcblib_library {
-                        append_pcblib_library_direct(&mut pcblib_library, library);
+                        append_pcblib_library_dedup(
+                            &mut pcblib_library,
+                            library,
+                            &mut pcblib_seen_names,
+                        );
                     }
                     summary.success += 1;
                 }
@@ -521,6 +547,9 @@ async fn export_batch_merged_fresh(
                 prepared,
                 &merged_pcblib_file,
                 options.lcsc_english,
+                &pcblib_seen_names,
+                &no_donors,
+                &options.output,
             )
             .await
             {
@@ -529,7 +558,11 @@ async fn export_batch_merged_fresh(
                         schlib_records.push(record);
                     }
                     if let Some(library) = artifacts.pcblib_library {
-                        append_pcblib_library_direct(&mut pcblib_library, library);
+                        append_pcblib_library_dedup(
+                            &mut pcblib_library,
+                            library,
+                            &mut pcblib_seen_names,
+                        );
                     }
                     summary.success += 1;
                     progress.record_success(&source_id, Some(&artifacts.component_name));
@@ -571,7 +604,7 @@ async fn export_batch_merged_fresh(
                 "cannot write merged PcbLib without any components".to_string(),
             ));
         }
-        write_pcblib(&pcblib_library, &pcblib_path)?;
+        write_pcblib_records(&pcblib_library, &pcblib_path)?;
         summary.generated_files.push(pcblib_path);
     }
 
@@ -618,7 +651,6 @@ async fn export_batch_merged_append(
     } else {
         PcblibRecordLibrary::default()
     };
-
     if schlib_records.is_empty() && pcblib_library.components.is_empty() {
         progress.note("Append mode: no existing merged npnp library found, creating a new one");
     } else {
@@ -631,15 +663,21 @@ async fn export_batch_merged_append(
 
     let mut known_identities = HashSet::new();
     let mut used_symbol_names = HashSet::new();
-    let mut used_footprint_names = HashSet::new();
+    let mut pcblib_seen_names: HashSet<String> = HashSet::new();
+    // Build a donor map: category → first existing SchLib record of that category.
+    // Used to copy the symbol shape when appending a same-category component.
+    let mut category_donors: HashMap<String, SchlibRecord> = HashMap::new();
     for record in &schlib_records {
         used_symbol_names.insert(record.name.to_ascii_lowercase());
         if let Some(identity) = record.identity.as_deref().and_then(normalize_lcsc_id) {
             known_identities.insert(identity);
         }
+        if let Some(cat) = read_schlib_param(&record.data, "Category") {
+            category_donors.entry(cat).or_insert_with(|| record.clone());
+        }
     }
     for component in &pcblib_library.components {
-        used_footprint_names.insert(component.name.to_ascii_lowercase());
+        pcblib_seen_names.insert(component.name.to_ascii_lowercase());
     }
 
     let mut added_any = false;
@@ -647,10 +685,24 @@ async fn export_batch_merged_append(
 
     for id in ids {
         let normalized_id = normalize_lcsc_id(&id).unwrap_or_else(|| id.clone());
-        if known_identities.contains(&normalized_id) {
+        if !options.force && known_identities.contains(&normalized_id) {
             summary.skipped += 1;
             progress.record_skip(&id, "already present");
             continue;
+        }
+
+        // Pre-release the names of records about to be force-replaced so the new export
+        // can claim the same name without collision.
+        if options.force && known_identities.contains(&normalized_id) {
+            for record in schlib_records.iter().filter(|r| {
+                r.identity
+                    .as_deref()
+                    .and_then(normalize_lcsc_id)
+                    .as_deref()
+                    == Some(normalized_id.as_str())
+            }) {
+                used_symbol_names.remove(&record.name.to_ascii_lowercase());
+            }
         }
 
         match export_merged_component(
@@ -658,22 +710,44 @@ async fn export_batch_merged_append(
             targets,
             &id,
             &mut used_symbol_names,
-            &mut used_footprint_names,
             &merged_pcblib_file,
             options.lcsc_english,
+            options.use_template,
+            &pcblib_seen_names,
+            &category_donors,
+            &options.output,
         )
         .await
         {
             Ok(artifacts) => {
+                // When force-replacing an existing component, remove the old record first.
+                if options.force && known_identities.contains(&artifacts.identity) {
+                    schlib_records.retain(|r| {
+                        r.identity
+                            .as_deref()
+                            .and_then(normalize_lcsc_id)
+                            .as_deref()
+                            != Some(&artifacts.identity)
+                    });
+                }
                 known_identities.insert(artifacts.identity);
                 if let Some(record) = artifacts.schlib_record {
+                    // Register as a donor for subsequent same-category components in this session.
+                    if let Some(cat) = read_schlib_param(&record.data, "Category") {
+                        category_donors.entry(cat).or_insert_with(|| record.clone());
+                    }
                     schlib_records.push(record);
                 }
-                if let Some(library) = artifacts.pcblib_library {
-                    append_pcblib_library(
-                        &mut pcblib_library,
-                        pcblib_records_from_library(&library)?,
-                    );
+                if let Some(records) = artifacts.pcblib_library {
+                    let deduped = PcblibRecordLibrary {
+                        components: records
+                            .components
+                            .into_iter()
+                            .filter(|c| pcblib_seen_names.insert(c.name.to_ascii_lowercase()))
+                            .collect(),
+                        models: records.models,
+                    };
+                    append_pcblib_library(&mut pcblib_library, deduped);
                 }
                 summary.success += 1;
                 added_any = true;
@@ -745,7 +819,7 @@ async fn prepare_merged_component(
     client: &LcedaClient,
     lcsc_id: &str,
     used_symbol_names: &mut HashSet<String>,
-    used_footprint_names: &mut HashSet<String>,
+    use_template: bool,
 ) -> Result<PreparedMergedComponent> {
     let item = client.select_item(lcsc_id, 1).await?;
     let component_name = merged_symbol_component_name(&item, lcsc_id, used_symbol_names);
@@ -754,11 +828,48 @@ async fn prepare_merged_component(
         .as_deref()
         .and_then(normalize_lcsc_id)
         .unwrap_or_else(|| lcsc_id.to_string());
-    let footprint_name = if let Some(footprint_uuid) = item.footprint_uuid() {
+
+    // Fast path: detect template footprint from item attributes without a network call.
+    // EasyEDA search results usually include the footprint name in item.raw, which is
+    // sufficient to detect the IPC package size. Skip the footprint detail fetch when possible.
+    if use_template {
+        let hint = footprint_name_from_item(&item);
+        if let Some((class, package, std_name)) = detect_template_footprint(&item, &hint) {
+            return Ok(PreparedMergedComponent {
+                source_id: lcsc_id.to_string(),
+                identity,
+                item,
+                component_name,
+                footprint_name: std_name,
+                template_ctx: Some((class, package)),
+            });
+        }
+    }
+
+    let (footprint_name, template_ctx) = if let Some(footprint_uuid) = item.footprint_uuid() {
         let footprint_data = client.component_detail(&footprint_uuid).await?;
-        merged_footprint_name(&item, &footprint_data, lcsc_id, used_footprint_names)
+        let easyeda_name = resolved_footprint_name(&item, &footprint_data);
+
+        // Try template detection before name reservation.
+        if use_template {
+            if let Some((class, package, std_name)) =
+                detect_template_footprint(&item, &easyeda_name)
+            {
+                (std_name, Some((class, package)))
+            } else {
+                (easyeda_name, None)
+            }
+        } else {
+            (easyeda_name, None)
+        }
     } else {
-        merged_symbol_component_name(&item, lcsc_id, used_footprint_names)
+        let base = item.display_name().trim();
+        let fp = if base.is_empty() {
+            lcsc_id.to_string()
+        } else {
+            format!("{base}_{lcsc_id}")
+        };
+        (fp, None)
     };
 
     Ok(PreparedMergedComponent {
@@ -767,6 +878,7 @@ async fn prepare_merged_component(
         item,
         component_name,
         footprint_name,
+        template_ctx,
     })
 }
 
@@ -775,13 +887,21 @@ async fn export_merged_component(
     targets: ExportTargets,
     lcsc_id: &str,
     used_symbol_names: &mut HashSet<String>,
-    used_footprint_names: &mut HashSet<String>,
     merged_pcblib_file: &str,
     lcsc_english: bool,
+    use_template: bool,
+    known_footprint_names: &HashSet<String>,
+    category_donors: &HashMap<String, SchlibRecord>,
+    template_dir: &Path,
 ) -> Result<MergeArtifacts> {
-    let prepared =
-        prepare_merged_component(client, lcsc_id, used_symbol_names, used_footprint_names).await?;
-    export_prepared_merged_component(client, targets, prepared, merged_pcblib_file, lcsc_english)
+    let prepared = prepare_merged_component(
+        client,
+        lcsc_id,
+        used_symbol_names,
+        use_template,
+    )
+    .await?;
+    export_prepared_merged_component(client, targets, prepared, merged_pcblib_file, lcsc_english, known_footprint_names, category_donors, template_dir)
         .await
 }
 
@@ -791,6 +911,9 @@ async fn export_prepared_merged_component(
     prepared: PreparedMergedComponent,
     merged_pcblib_file: &str,
     lcsc_english: bool,
+    known_footprint_names: &HashSet<String>,
+    category_donors: &HashMap<String, SchlibRecord>,
+    template_dir: &Path,
 ) -> Result<MergeArtifacts> {
     let PreparedMergedComponent {
         source_id: _,
@@ -798,24 +921,83 @@ async fn export_prepared_merged_component(
         item,
         component_name,
         footprint_name,
+        template_ctx,
     } = prepared;
 
-    let pcblib_library = if targets.pcblib {
-        let library = build_pcblib_library_for_item(client, &item, &footprint_name).await?;
-        Some(library)
+    let footprint_already_exists = !footprint_name.is_empty()
+        && known_footprint_names.contains(&footprint_name.to_ascii_lowercase());
+
+    let pcblib_library: Option<PcblibRecordLibrary> = if targets.pcblib && !footprint_already_exists {
+        if let Some((class, package)) = &template_ctx {
+            // Prefer template from library dir (npnp_template.PcbLib).
+            let records = load_pcblib_template_records(template_dir, *class, package)
+                .or_else(|| {
+                    // Fallback to assets/ — and promote to output dir on first use.
+                    let r = find_assets_dir().and_then(|d| load_pcblib_template_records(&d, *class, package));
+                    if let Some(ref rec) = r {
+                        save_pcblib_template(template_dir, *class, package, rec);
+                    }
+                    r
+                });
+            if let Some(records) = records {
+                Some(records)
+            } else {
+                // Fall back to programmatic IPC footprint; try local STEP then online.
+                let step_bytes = load_local_step(template_dir, *class, package)
+                    .or_else(|| find_assets_dir().and_then(|d| load_local_step(&d, *class, package)));
+                let step_bytes = if step_bytes.is_some() {
+                    step_bytes
+                } else if let Some(fp_uuid) = item.footprint_uuid() {
+                    if let Ok(fp_data) = client.component_detail(&fp_uuid).await {
+                        crate::workflow::load_step_bytes_for_pcblib_pub(client, &item, &fp_data)
+                            .await
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+                let library = build_ipc_pcblib(*class, package, &footprint_name, step_bytes)?;
+                let records = pcblib_records_from_library(&library)?;
+                save_pcblib_template(template_dir, *class, package, &records);
+                Some(records)
+            }
+        } else {
+            // Non-template footprint (electrolytic caps, ICs, etc.): check cache first.
+            let cached = if !footprint_name.is_empty() {
+                load_pcblib_template_by_name(template_dir, &footprint_name)
+            } else {
+                None
+            };
+            if let Some(records) = cached {
+                Some(records)
+            } else {
+                let library = build_pcblib_library_for_item(client, &item, &footprint_name).await?;
+                let records = pcblib_records_from_library(&library)?;
+                if !footprint_name.is_empty() {
+                    save_pcblib_template_by_name(template_dir, &footprint_name, &records);
+                }
+                Some(records)
+            }
+        }
     } else {
         None
     };
 
-    let footprint_link_is_valid = pcblib_library
-        .as_ref()
-        .map(|library| {
-            library
-                .components
-                .iter()
-                .any(|component| component.name.eq_ignore_ascii_case(&footprint_name))
-        })
-        .unwrap_or(false);
+    let footprint_link_is_valid = footprint_already_exists
+        || if template_ctx.is_some() {
+            !footprint_name.is_empty()
+        } else {
+            pcblib_library
+                .as_ref()
+                .map(|library| {
+                    library
+                        .components
+                        .iter()
+                        .any(|component| component.name.eq_ignore_ascii_case(&footprint_name))
+                })
+                .unwrap_or(false)
+        };
 
     let schlib_record = if targets.schlib {
         let english_metadata = if lcsc_english {
@@ -823,35 +1005,233 @@ async fn export_prepared_merged_component(
         } else {
             None
         };
-        let (footprint_model_name, footprint_library_file) = if footprint_link_is_valid {
-            (Some(footprint_name.as_str()), Some(merged_pcblib_file))
+
+        // Override component_name with passive naming scheme when LCSC metadata is available.
+        // Polarized caps use ECAP convention; others use standard passive naming.
+        let component_name = if let Some(product) = &english_metadata {
+            let designator = item.raw
+                .get("attributes")
+                .and_then(|a| a.get("Designator"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let params: Vec<SchlibParameter> = product.properties.iter()
+                .map(|p| SchlibParameter { name: p.name.clone(), value: p.value.clone() })
+                .collect();
+            let is_ecap = product.is_polarized_capacitor();
+            if is_ecap {
+                product.effective_category()
+                    .and_then(|cat| build_ecap_component_name(cat, &params, Some(&identity)))
+                    .unwrap_or_else(|| component_name.clone())
+            } else {
+                build_passive_component_name(designator, &params, Some(&identity))
+                    .unwrap_or_else(|| component_name.clone())
+            }
         } else {
-            (None, None)
+            component_name.clone()
         };
-        let component = build_schlib_component_for_item_with_metadata(
-            client,
-            &item,
-            &component_name,
-            footprint_model_name,
-            footprint_library_file,
-            english_metadata.as_ref(),
-        )
-        .await?;
-        Some(schlib_record_from_component(&component)?)
+
+        // Detect polarized capacitors (electrolytic, tantalum, etc.).
+        // Intentionally independent of template_ctx: radial ECAPs have no chip footprint
+        // but still use the CE schematic template.
+        let polarized_cap = english_metadata
+            .as_ref()
+            .is_some_and(|p| p.is_polarized_capacitor());
+
+        // Resolve SchLib template name: "CE" for polarized caps, "R"/"C" for standard chips.
+        let schlib_template_name: Option<&str> = if polarized_cap {
+            Some("CE")
+        } else {
+            template_ctx.as_ref().and_then(|(class, _)| match class {
+                ComponentClass::ChipResistor => Some("R"),
+                ComponentClass::ChipCapacitor => Some("C"),
+                ComponentClass::Other => None,
+            })
+        };
+
+        // Fast path: template + LCSC metadata → patch template directly, no EasyEDA fetch.
+        // Pre-load SchLib template so the if-let chain below doesn't need find_assets_dir() in the middle.
+        let schlib_tmpl_for_fast_path = if let Some(name) = schlib_template_name {
+            load_schlib_template_by_name(template_dir, name).or_else(|| {
+                let r = find_assets_dir().and_then(|d| load_schlib_template_by_name(&d, name));
+                if let Some(ref rec) = r {
+                    if name != "CE" { promote_schlib_template(template_dir, rec); }
+                }
+                r
+            })
+        } else {
+            None
+        };
+        let record = if let Some(product) = &english_metadata
+            && template_ctx.is_some()
+            && let Some(mut tmpl) = schlib_tmpl_for_fast_path
+        {
+            let template_designator = tmpl.name.clone();
+            let description = product.description.clone().unwrap_or_default();
+            let fp_name = if footprint_link_is_valid { footprint_name.as_str() } else { "" };
+            let replacements = build_schlib_replacements_from_lcsc(product, fp_name);
+            let footprint_link = if footprint_link_is_valid && !footprint_name.is_empty() {
+                Some((footprint_name.as_str(), merged_pcblib_file))
+            } else {
+                None
+            };
+            tmpl.data = patch_schlib_data_with_params(
+                &strip_schlib_params(&tmpl.data),
+                &component_name,
+                Some(&description),
+                &replacements,
+                footprint_link,
+                &["1", "2"],
+                SCHLIB_PARAM_RENAMES,
+                &template_designator,
+            );
+            tmpl.name = component_name.clone();
+            tmpl.description = description;
+            tmpl.identity = Some(identity.clone());
+            tmpl
+        } else if let Some(product) = &english_metadata
+            && let Some(cat) = product.effective_category()
+            && let Some(donor) = category_donors.get(cat)
+        {
+            // Category donor path: copy the existing symbol shape from a same-category component,
+            // strip its parameters and footprint link, then re-inject fresh ones for this component.
+            // Skips the EasyEDA network fetch entirely.
+            let description = product.description.clone().unwrap_or_default();
+            let fp_name = if footprint_link_is_valid { footprint_name.as_str() } else { "" };
+            let replacements = build_schlib_replacements_from_lcsc(product, fp_name);
+            let footprint_link = if footprint_link_is_valid && !footprint_name.is_empty() {
+                Some((footprint_name.as_str(), merged_pcblib_file))
+            } else {
+                None
+            };
+            let pin_designators = read_schlib_pin_designators(&donor.data);
+            let pin_refs: Vec<&str> = pin_designators.iter().map(String::as_str).collect();
+            let stripped = strip_schlib_params(&donor.data);
+            let mut record = donor.clone();
+            record.data = patch_schlib_data_with_params(
+                &stripped,
+                &component_name,
+                Some(&description),
+                &replacements,
+                footprint_link,
+                &pin_refs,
+                SCHLIB_PARAM_RENAMES,
+                schlib_template_name.unwrap_or(""),
+            );
+            record.name = component_name.clone();
+            record.description = description;
+            record.identity = Some(identity.clone());
+            record
+        } else {
+            // Standard path: fetch EasyEDA symbol, optionally apply template.
+            let (footprint_model_name, footprint_library_file) = if footprint_link_is_valid {
+                (Some(footprint_name.as_str()), Some(merged_pcblib_file))
+            } else {
+                (None, None)
+            };
+            let component = build_schlib_component_for_item_with_metadata(
+                client,
+                &item,
+                &component_name,
+                footprint_model_name,
+                footprint_library_file,
+                english_metadata.as_ref(),
+            )
+            .await?;
+
+            let schlib_tmpl_for_std_path = if let Some(name) = schlib_template_name {
+                load_schlib_template_by_name(template_dir, name).or_else(|| {
+                    let r = find_assets_dir().and_then(|d| load_schlib_template_by_name(&d, name));
+                    if let Some(ref rec) = r {
+                        if name != "CE" { promote_schlib_template(template_dir, rec); }
+                    }
+                    r
+                })
+            } else {
+                None
+            };
+            if let Some(mut tmpl) = schlib_tmpl_for_std_path {
+                let template_designator = tmpl.name.clone();
+                let base = schlib_record_from_component(&component)?;
+                let description = base.description.clone();
+                let stripped = strip_schlib_params(&tmpl.data);
+                let named = patch_schlib_data_component_name(
+                    &stripped,
+                    &base.name,
+                    base.identity.as_deref(),
+                );
+                let (replacements, footprint_link) = if let Some(product) = &english_metadata {
+                    let fp_name = if footprint_link_is_valid { footprint_name.as_str() } else { "" };
+                    let reps = build_schlib_replacements_from_lcsc(product, fp_name);
+                    let fp_link = if footprint_link_is_valid && !footprint_name.is_empty() {
+                        Some((footprint_name.as_str(), merged_pcblib_file))
+                    } else {
+                        None
+                    };
+                    (reps, fp_link)
+                } else {
+                    (build_link_replacements_from_lcsc_id(&identity), None)
+                };
+                tmpl.data = patch_schlib_data_with_params(
+                    &named,
+                    &base.name,
+                    Some(&description),
+                    &replacements,
+                    footprint_link,
+                    &["1", "2"],
+                    SCHLIB_PARAM_RENAMES,
+                    &template_designator,
+                );
+                tmpl.name = base.name;
+                tmpl.description = description;
+                tmpl.identity = base.identity;
+                tmpl.weight = base.weight.max(tmpl.weight);
+                tmpl
+            } else {
+                let record = schlib_record_from_component(&component)?;
+                // When a template was expected but absent, save this EasyEDA symbol (stripped)
+                // as the new template for future fetches. CE is user-managed, so skip.
+                if !polarized_cap {
+                    if let Some((class, _)) = &template_ctx {
+                        if let Some(name) = schlib_template_name {
+                            if load_schlib_template_by_name(template_dir, name).is_none() {
+                                save_schlib_template(template_dir, *class, &record);
+                            }
+                        }
+                    }
+                }
+                record
+            }
+        };
+
+        Some(record)
     } else {
         None
     };
 
     Ok(MergeArtifacts {
         identity,
-        component_name,
+        component_name: schlib_record
+            .as_ref()
+            .map(|r| r.name.clone())
+            .unwrap_or(component_name),
         schlib_record,
         pcblib_library,
     })
 }
 
-fn append_pcblib_library_direct(target: &mut PcbLibrary, source: PcbLibrary) {
-    target.components.extend(source.components);
+
+/// Append records, skipping any component whose name already exists in `seen`.
+/// Used when template footprints might be duplicated (multiple R/C with same package).
+fn append_pcblib_library_dedup(
+    target: &mut PcblibRecordLibrary,
+    source: PcblibRecordLibrary,
+    seen: &mut HashSet<String>,
+) {
+    for component in source.components {
+        if seen.insert(component.name.to_ascii_lowercase()) {
+            target.components.push(component);
+        }
+    }
     target.models.extend(source.models);
 }
 
@@ -887,15 +1267,6 @@ fn merged_symbol_component_name(
     reserve_merged_name(base, lcsc_id, used_names)
 }
 
-fn merged_footprint_name(
-    item: &SearchItem,
-    footprint_data: &serde_json::Value,
-    lcsc_id: &str,
-    used_names: &mut HashSet<String>,
-) -> String {
-    let base = resolved_footprint_name(item, footprint_data);
-    reserve_merged_name(&base, lcsc_id, used_names)
-}
 
 fn append_pcblib_library(target: &mut PcblibRecordLibrary, source: PcblibRecordLibrary) {
     target.components.extend(source.components);
@@ -1027,13 +1398,21 @@ async fn export_component(
             &schlib_dir,
             options.force,
             options.lcsc_english,
+            options.use_template,
         )
         .await?;
     }
 
     if targets.pcblib {
         let pcblib_dir = options.output.join("pcblib");
-        export_pcblib(client, &item, &pcblib_dir, options.force).await?;
+        export_pcblib_with_options(
+            client,
+            &item,
+            &pcblib_dir,
+            options.force,
+            options.use_template,
+        )
+        .await?;
     }
 
     Ok(ExportedComponent { display_name })
@@ -1154,6 +1533,7 @@ mod tests {
             parallel: 1,
             continue_on_error: false,
             lcsc_english: false,
+            use_template: false,
             force: false,
         };
 

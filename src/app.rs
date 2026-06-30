@@ -10,7 +10,7 @@ use crate::error::Result;
 use crate::lceda::LcedaClient;
 use crate::merge::extract_lcsc_ids_from_schlib;
 use crate::workflow::{
-    download_obj, download_step, export_bundle, export_easyeda_sources, export_pcblib,
+    download_obj, download_step, export_bundle, export_easyeda_sources, export_pcblib_with_options,
     export_schlib_with_options,
 };
 
@@ -118,21 +118,32 @@ pub async fn run_cli(cli: Cli, invoked_as: &str) -> Result<()> {
             index,
             output,
             lcsc_english,
+            use_template,
             force,
         } => {
             let item = client.select_item(&keyword, index).await?;
-            let path =
-                export_schlib_with_options(&client, &item, &output, force, lcsc_english).await?;
+            let path = export_schlib_with_options(
+                &client,
+                &item,
+                &output,
+                force,
+                lcsc_english,
+                use_template,
+            )
+            .await?;
             println!("SchLib saved: {}", path.display());
         }
         Commands::ExportPcblib {
             keyword,
             index,
             output,
+            use_template,
             force,
         } => {
             let item = client.select_item(&keyword, index).await?;
-            let path = export_pcblib(&client, &item, &output, force).await?;
+            let path =
+                export_pcblib_with_options(&client, &item, &output, force, use_template)
+                    .await?;
             println!("PcbLib saved: {}", path.display());
         }
         Commands::Bundle {
@@ -168,6 +179,7 @@ pub async fn run_cli(cli: Cli, invoked_as: &str) -> Result<()> {
             parallel,
             continue_on_error,
             lcsc_english,
+            use_template,
             force,
         } => {
             let summary = export_batch(
@@ -184,6 +196,7 @@ pub async fn run_cli(cli: Cli, invoked_as: &str) -> Result<()> {
                     parallel,
                     continue_on_error,
                     lcsc_english,
+                    use_template,
                     force,
                 },
             )
@@ -207,6 +220,7 @@ pub async fn run_cli(cli: Cli, invoked_as: &str) -> Result<()> {
             library_name,
             parallel,
             lcsc_english,
+            use_template,
         } => {
             let ids = extract_lcsc_ids_from_schlib(&schlib)?;
             if ids.is_empty() {
@@ -252,6 +266,7 @@ pub async fn run_cli(cli: Cli, invoked_as: &str) -> Result<()> {
                     parallel,
                     continue_on_error: true,
                     lcsc_english,
+                    use_template,
                     force: true,
                 },
             )

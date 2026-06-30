@@ -9,6 +9,7 @@ pub mod merge;
 pub mod pcblib;
 mod passive_naming;
 pub mod schlib;
+pub mod template;
 pub mod util;
 pub mod workflow;
 
