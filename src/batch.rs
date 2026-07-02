@@ -37,7 +37,6 @@ use crate::workflow::{export_pcblib_with_options, export_schlib_with_options};
 
 #[derive(Debug, Clone)]
 pub struct BatchOptions {
-    pub input: PathBuf,
     pub output: PathBuf,
     pub schlib: bool,
     pub pcblib: bool,
@@ -63,23 +62,38 @@ pub struct BatchSummary {
     pub generated_files: Vec<PathBuf>,
 }
 
-pub async fn export_batch(client: &LcedaClient, options: BatchOptions) -> Result<BatchSummary> {
-    let targets = ExportTargets::resolve(&options)?;
-    if options.merge {
-        return export_batch_merged(client, options, targets).await;
-    }
-
-    let options = Arc::new(options);
-
-    fs::create_dir_all(&options.output)?;
-
-    let input = fs::read_to_string(&options.input)?;
-    let ids = parse_lcsc_ids(&input);
+pub async fn export_batch(
+    client: &LcedaClient,
+    input: &Path,
+    options: BatchOptions,
+) -> Result<BatchSummary> {
+    let text = fs::read_to_string(input)?;
+    let ids = parse_lcsc_ids(&text);
     if ids.is_empty() {
         return Err(AppError::Other(
             "no valid LCSC IDs found in batch input".to_string(),
         ));
     }
+    export_batch_from_ids(client, ids, options).await
+}
+
+pub async fn export_batch_from_ids(
+    client: &LcedaClient,
+    ids: Vec<String>,
+    options: BatchOptions,
+) -> Result<BatchSummary> {
+    if ids.is_empty() {
+        return Err(AppError::Other("no LCSC IDs provided".to_string()));
+    }
+    let targets = ExportTargets::resolve(&options)?;
+    if options.merge {
+        fs::create_dir_all(&options.output)?;
+        return export_batch_merged(client, options, targets, ids).await;
+    }
+
+    let options = Arc::new(options);
+
+    fs::create_dir_all(&options.output)?;
 
     let checkpoint_path = options.output.join(".checkpoint");
     let completed = load_checkpoint(&checkpoint_path)?;
@@ -213,6 +227,16 @@ struct PreparedMergedComponent {
     component_name: String,
     footprint_name: String,
     /// Set when use_template detected a chip R/C with a known IPC package.
+    template_ctx: Option<(ComponentClass, String)>,
+}
+
+/// Network-fetched data before name assignment. Used by the parallel prepare phase.
+#[derive(Debug)]
+struct RawFetchedComponent {
+    source_id: String,
+    identity: String,
+    item: SearchItem,
+    footprint_name: String,
     template_ctx: Option<(ComponentClass, String)>,
 }
 
@@ -358,17 +382,8 @@ async fn export_batch_merged(
     client: &LcedaClient,
     options: BatchOptions,
     targets: ExportTargets,
+    ids: Vec<String>,
 ) -> Result<BatchSummary> {
-    fs::create_dir_all(&options.output)?;
-
-    let input = fs::read_to_string(&options.input)?;
-    let ids = parse_lcsc_ids(&input);
-    if ids.is_empty() {
-        return Err(AppError::Other(
-            "no valid LCSC IDs found in batch input".to_string(),
-        ));
-    }
-
     let summary = BatchSummary {
         total: ids.len(),
         skipped: 0,
@@ -416,32 +431,76 @@ async fn export_batch_merged_fresh(
 
     progress.note(format!("Library: {library_name}"));
 
-    let mut used_symbol_names = HashSet::new();
     let mut schlib_records = Vec::new();
     let mut pcblib_library = PcblibRecordLibrary::default();
     let mut pcblib_seen_names: HashSet<String> = HashSet::new();
     let mut first_error = None;
     let mut prepared_components = Vec::with_capacity(ids.len());
 
-    for id in ids {
-        match prepare_merged_component(
-            client,
-            &id,
-            &mut used_symbol_names,
-            options.use_template,
-        )
-        .await
-        {
-            Ok(prepared) => prepared_components.push(prepared),
-            Err(err) => {
-                summary.failed += 1;
-                summary.failed_ids.push(id.clone());
-                progress.record_failure(&id, &err);
-                if first_error.is_none() {
-                    first_error = Some(err);
+    // Phase 1: fetch all component data in parallel (network I/O only, no shared state).
+    {
+        let semaphore = Arc::new(Semaphore::new(options.parallel));
+        let mut join_set: JoinSet<(usize, String, Result<RawFetchedComponent>)> =
+            JoinSet::new();
+        for (idx, id) in ids.into_iter().enumerate() {
+            let client = client.clone();
+            let semaphore = semaphore.clone();
+            let use_template = options.use_template;
+            join_set.spawn(async move {
+                let _permit = semaphore
+                    .acquire_owned()
+                    .await
+                    .expect("prepare semaphore should remain open");
+                let result = fetch_merged_component_raw(&client, &id, use_template).await;
+                (idx, id, result)
+            });
+        }
+
+        let mut raw: Vec<(usize, String, Result<RawFetchedComponent>)> = Vec::new();
+        while let Some(joined) = join_set.join_next().await {
+            match joined {
+                Ok(item) => raw.push(item),
+                Err(err) => {
+                    let batch_err =
+                        AppError::Other(format!("prepare task join failed: {err}"));
+                    progress.record_failure("<join>", &batch_err);
+                    if first_error.is_none() {
+                        first_error = Some(batch_err);
+                    }
                 }
-                if !options.continue_on_error {
-                    return Err(first_error.unwrap());
+            }
+        }
+        raw.sort_unstable_by_key(|(idx, _, _)| *idx);
+
+        // Phase 2: assign symbol names sequentially to preserve deterministic ordering.
+        let mut used_symbol_names: HashSet<String> = HashSet::new();
+        for (_, id, result) in raw {
+            match result {
+                Ok(raw) => {
+                    let component_name = merged_symbol_component_name(
+                        &raw.item,
+                        &raw.source_id,
+                        &mut used_symbol_names,
+                    );
+                    prepared_components.push(PreparedMergedComponent {
+                        source_id: raw.source_id,
+                        identity: raw.identity,
+                        item: raw.item,
+                        component_name,
+                        footprint_name: raw.footprint_name,
+                        template_ctx: raw.template_ctx,
+                    });
+                }
+                Err(err) => {
+                    summary.failed += 1;
+                    summary.failed_ids.push(id.clone());
+                    progress.record_failure(&id, &err);
+                    if first_error.is_none() {
+                        first_error = Some(err);
+                    }
+                    if !options.continue_on_error {
+                        return Err(first_error.unwrap());
+                    }
                 }
             }
         }
@@ -815,6 +874,67 @@ fn write_merged_outputs(
         summary.generated_files.push(pcblib_path.to_path_buf());
     }
     Ok(())
+}
+
+/// Fetch all network data for a merged component without assigning a symbol name.
+/// Safe to call in parallel — does not touch shared mutable state.
+async fn fetch_merged_component_raw(
+    client: &LcedaClient,
+    lcsc_id: &str,
+    use_template: bool,
+) -> Result<RawFetchedComponent> {
+    let item = client.select_item(lcsc_id, 1).await?;
+    let identity = item
+        .lcsc_id()
+        .as_deref()
+        .and_then(normalize_lcsc_id)
+        .unwrap_or_else(|| lcsc_id.to_string());
+
+    if use_template {
+        let hint = footprint_name_from_item(&item);
+        if let Some((class, package, std_name)) = detect_template_footprint(&item, &hint) {
+            return Ok(RawFetchedComponent {
+                source_id: lcsc_id.to_string(),
+                identity,
+                item,
+                footprint_name: std_name,
+                template_ctx: Some((class, package)),
+            });
+        }
+    }
+
+    let (footprint_name, template_ctx) = if let Some(footprint_uuid) = item.footprint_uuid() {
+        let footprint_data = client.component_detail(&footprint_uuid).await?;
+        let easyeda_name = resolved_footprint_name(&item, &footprint_data);
+
+        if use_template {
+            if let Some((class, package, std_name)) =
+                detect_template_footprint(&item, &easyeda_name)
+            {
+                (std_name, Some((class, package)))
+            } else {
+                (easyeda_name, None)
+            }
+        } else {
+            (easyeda_name, None)
+        }
+    } else {
+        let base = item.display_name().trim();
+        let fp = if base.is_empty() {
+            lcsc_id.to_string()
+        } else {
+            format!("{base}_{lcsc_id}")
+        };
+        (fp, None)
+    };
+
+    Ok(RawFetchedComponent {
+        source_id: lcsc_id.to_string(),
+        identity,
+        item,
+        footprint_name,
+        template_ctx,
+    })
 }
 
 async fn prepare_merged_component(
@@ -1282,15 +1402,7 @@ fn resolve_library_name(options: &BatchOptions) -> String {
             return trimmed.to_string();
         }
     }
-
-    options
-        .input
-        .file_stem()
-        .and_then(|stem| stem.to_str())
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .unwrap_or("MergedLib")
-        .to_string()
+    "MergedLib".to_string()
 }
 
 async fn run_sequential(
@@ -1522,9 +1634,8 @@ mod tests {
     }
 
     #[test]
-    fn resolve_library_name_defaults_to_input_stem() {
+    fn resolve_library_name_defaults_to_mergedlib() {
         let options = BatchOptions {
-            input: PathBuf::from("ids.txt"),
             output: PathBuf::from("out"),
             schlib: true,
             pcblib: false,
@@ -1539,7 +1650,7 @@ mod tests {
             force: false,
         };
 
-        assert_eq!(resolve_library_name(&options), "ids");
+        assert_eq!(resolve_library_name(&options), "MergedLib");
     }
 
     #[test]

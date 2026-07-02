@@ -4,7 +4,7 @@ use std::path::Path;
 
 use clap::{CommandFactory, Parser};
 
-use crate::batch::{BatchOptions, export_batch};
+use crate::batch::{BatchOptions, export_batch, export_batch_from_ids};
 use crate::cli::{Cli, Commands};
 use crate::error::Result;
 use crate::lceda::LcedaClient;
@@ -184,8 +184,8 @@ pub async fn run_cli(cli: Cli, invoked_as: &str) -> Result<()> {
         } => {
             let summary = export_batch(
                 &client,
+                &input,
                 BatchOptions {
-                    input,
                     output,
                     schlib,
                     pcblib,
@@ -239,8 +239,6 @@ pub async fn run_cli(cli: Cli, invoked_as: &str) -> Result<()> {
                     .unwrap_or_else(|| std::path::PathBuf::from("."))
             });
             fs::create_dir_all(&output)?;
-            let temp_input = output.join(".refresh_ids.tmp");
-            fs::write(&temp_input, ids.join("\n"))?;
             let library_name = library_name.or_else(|| {
                 schlib
                     .file_stem()
@@ -252,10 +250,10 @@ pub async fn run_cli(cli: Cli, invoked_as: &str) -> Result<()> {
                 "pcblib" => (false, true, false),
                 _ => (false, false, true),
             };
-            let result = export_batch(
+            let summary = export_batch_from_ids(
                 &client,
+                ids,
                 BatchOptions {
-                    input: temp_input.clone(),
                     output: output.clone(),
                     schlib: schlib_out,
                     pcblib: pcblib_out,
@@ -270,9 +268,7 @@ pub async fn run_cli(cli: Cli, invoked_as: &str) -> Result<()> {
                     force: true,
                 },
             )
-            .await;
-            let _ = fs::remove_file(&temp_input);
-            let summary = result?;
+            .await?;
             println!(
                 "Refresh complete. Total: {} | Success: {} | Failed: {}",
                 summary.total, summary.success, summary.failed
