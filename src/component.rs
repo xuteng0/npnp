@@ -97,13 +97,19 @@ pub(crate) fn build_schlib_replacements_from_lcsc(
     if let Some(cat) = product.effective_category() {
         map.insert("Category".to_string(), cat.to_string());
     }
+    // Altium renders a "Links" section from ComponentLink{n}Description + ComponentLink{n}URL
+    // pairs. Both must be present — a lone URL param without its Description is ignored.
+    // Components whose EasyEDA template already defines these slots get the URL patched in;
+    // components with no pre-existing slots get new RECORD=41 param blocks written.
     if let Some(ds) = &product.datasheet_url {
         map.insert("Datasheet".to_string(), ds.clone());
         map.insert("ComponentLink1URL".to_string(), ds.clone());
+        map.insert("ComponentLink1Description".to_string(), "Datasheet".to_string());
     }
     let supplier_link = format!("https://www.lcsc.com/search?q={}", product.sku);
     map.insert("Supplier Link".to_string(), supplier_link.clone());
     map.insert("ComponentLink2URL".to_string(), supplier_link);
+    map.insert("ComponentLink2Description".to_string(), "Supplier Link".to_string());
     for prop in &product.properties {
         map.insert(prop.name.clone(), prop.value.clone());
     }
